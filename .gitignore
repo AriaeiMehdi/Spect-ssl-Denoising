@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+artifacts/
+artifacts/cache/
+artifacts/manifests/
+artifacts/qc/
+artifacts/geometry/
+artifacts/runs/
+artifacts/visualizations/
+artifacts/denoising_dicom_validation3/
+datasets/

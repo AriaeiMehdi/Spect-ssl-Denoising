@@ -1,0 +1,10 @@
+seed: 20260806
+allowed_modalities: [NM]
+require_complete_gate_view_grid: true
+exposure:
+  q_clip: [0.02, 1.25]
+  low_information_q: 0.20
+  view_variation_threshold: 0.10
+qc:
+  manual_review_minimum: 50
+  parse_success_minimum: 0.99

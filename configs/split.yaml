@@ -1,0 +1,10 @@
+seed: 20260806
+dataset2:
+  train_fraction: 0.70
+  validation_fraction: 0.15
+  test_fraction: 0.15
+  minimum_patients_per_split: 10
+dataset1:
+  validation_fraction: 0.05
+  minimum_validation_patients: 10
+  exclude_dataset2_splits: [validation, test]

@@ -1,0 +1,6 @@
+# Resolved in the requested interpreter on 2026-08-07.
+# The torch wheel is CUDA 12.4; keep the existing environment's index policy.
+numpy==2.4.6
+scipy==1.15.3
+pydicom==3.0.1
+torch==2.5.1+cu124
