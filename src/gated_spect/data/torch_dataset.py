@@ -51,6 +51,9 @@ class NormalizationStats:
     @classmethod
     def from_json(cls, path: str | Path) -> "NormalizationStats":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        from ..versioning import require_artifact_versions
+
+        require_artifact_versions(payload, artifact_name=f"normalization {path}")
         if "stats" in payload:
             payload = payload["stats"]
         return cls(**payload)
@@ -254,10 +257,9 @@ class PretrainingDataset(Dataset[dict[str, Any]]):
     def _build_view(self, index: int, *, seed_offset: int = 0, teacher: bool = False) -> dict[str, Any]:
         item, sample = self.base._read(index)
         sample_id = str(item["meta"]["sample_id"])
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = 0 if worker_info is None else int(worker_info.id)
+        stream = "teacher" if teacher else ("student_a" if int(seed_offset) == 0 else "student_b")
         seed = count_split_seed(
-            self.global_seed + int(seed_offset), self.epoch, sample_id, worker_id
+            self.global_seed, self.epoch, sample_id, stream
         )
         rng = torch.Generator(device="cpu")
         rng.manual_seed(seed)
@@ -358,6 +360,9 @@ class PairDataset(Dataset[dict[str, Any]]):
         *,
         config: ReaderConfig,
         normalization: NormalizationStats = NormalizationStats(),
+        scanner_vocab: Mapping[str, int] | None = None,
+        collimator_vocab: Mapping[str, int] | None = None,
+        stress_rest_vocab: Mapping[str, int] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         rows = _read_records(pair_records)
@@ -366,9 +371,17 @@ class PairDataset(Dataset[dict[str, Any]]):
             raise ValueError("pair dataset contains no accepted pairs")
         self.config = config
         self.normalization = normalization
-        self.scanner_vocab = _vocabulary(self.records, "scanner_id")
-        self.collimator_vocab = _vocabulary(self.records, "collimator_id")
-        self.stress_vocab = _vocabulary(self.records, "stress_rest")
+        self.scanner_vocab = dict(scanner_vocab) if scanner_vocab is not None else _vocabulary(self.records, "scanner_id")
+        self.collimator_vocab = (
+            dict(collimator_vocab)
+            if collimator_vocab is not None
+            else _vocabulary(self.records, "collimator_id")
+        )
+        self.stress_vocab = (
+            dict(stress_rest_vocab)
+            if stress_rest_vocab is not None
+            else _vocabulary(self.records, "stress_rest")
+        )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -413,9 +426,15 @@ class PairDataset(Dataset[dict[str, Any]]):
             "radii_mm": torch.from_numpy(low.radii_mm.astype(np.float32)),
             "gate_phase_rad": torch.from_numpy(low.gate_phase_rad.astype(np.float32)),
             "split_fraction": torch.zeros(1, dtype=torch.float32),
-            "scanner_index": torch.tensor(0, dtype=torch.long),
-            "collimator_index": torch.tensor(0, dtype=torch.long),
-            "stress_rest_index": torch.tensor(0, dtype=torch.long),
+            "scanner_index": torch.tensor(
+                _category_index(self.scanner_vocab, low.scanner_id), dtype=torch.long
+            ),
+            "collimator_index": torch.tensor(
+                _category_index(self.collimator_vocab, low.collimator_id), dtype=torch.long
+            ),
+            "stress_rest_index": torch.tensor(
+                _category_index(self.stress_vocab, low.stress_rest), dtype=torch.long
+            ),
             "meta": {
                 "pair_id": str(row.get("pair_id", "")),
                 "patient_key": str(row.get("patient_key", low.patient_key)),

@@ -13,8 +13,13 @@ from typing import Any, Callable, Iterable, Literal, Mapping
 import torch
 from torch import Tensor, nn
 
-from .consistency_steps import TwoViewPretrainingLoss, two_view_pretraining_step
+from .consistency_steps import (
+    TwoViewPretrainingLoss,
+    optimizer_step_succeeded,
+    two_view_pretraining_step,
+)
 from .steps import DenoisingLoss, PretrainingLoss, denoising_step, pretraining_step
+from ..versioning import artifact_version_metadata, require_artifact_versions
 
 
 TaskName = Literal["pretraining", "denoising"]
@@ -422,6 +427,7 @@ def train_two_view_epoch(
     gradient_norms: list[float] = []
     last_gradient_norm: float | None = None
     optimizer_steps = 0
+    optimizer_step_skips = 0
     started = time.perf_counter()
     total_batches = _loader_batch_count(loader, max_batches)
     optimizer.zero_grad(set_to_none=True)
@@ -461,17 +467,23 @@ def train_two_view_epoch(
             measured_norm = nn.utils.clip_grad_norm_(parameters, 1.0)
             last_gradient_norm = _record_gradient_norm(measured_norm, gradient_norms)
             if scaler is not None and autocast_enabled:
-                scaler.step(optimizer)
-                scaler.update()
+                successful_step = optimizer_step_succeeded(
+                    optimizer, scaler=scaler, autocast_enabled=autocast_enabled
+                )
             else:
-                optimizer.step()
+                successful_step = optimizer_step_succeeded(
+                    optimizer, scaler=None, autocast_enabled=False
+                )
             optimizer.zero_grad(set_to_none=True)
-            ema_teacher.update(model.backbone)
-            if queued_values:
-                consistency_head.queue.enqueue(torch.cat(queued_values, dim=0))
-            queued_values.clear()
+            if successful_step:
+                ema_teacher.update(model.backbone)
+                if queued_values:
+                    consistency_head.queue.enqueue(torch.cat(queued_values, dim=0))
+                optimizer_steps += 1
+            else:
+                queued_values.clear()
+                optimizer_step_skips += 1
             pending = 0
-            optimizer_steps += 1
         metric_values.append(
             (
                 float(loss.total.detach().cpu()),
@@ -528,15 +540,22 @@ def train_two_view_epoch(
         measured_norm = nn.utils.clip_grad_norm_(parameters, 1.0)
         last_gradient_norm = _record_gradient_norm(measured_norm, gradient_norms)
         if scaler is not None and autocast_enabled:
-            scaler.step(optimizer)
-            scaler.update()
+            successful_step = optimizer_step_succeeded(
+                optimizer, scaler=scaler, autocast_enabled=autocast_enabled
+            )
         else:
-            optimizer.step()
+            successful_step = optimizer_step_succeeded(
+                optimizer, scaler=None, autocast_enabled=False
+            )
         optimizer.zero_grad(set_to_none=True)
-        ema_teacher.update(model.backbone)
-        if queued_values:
-            consistency_head.queue.enqueue(torch.cat(queued_values, dim=0))
-        optimizer_steps += 1
+        if successful_step:
+            ema_teacher.update(model.backbone)
+            if queued_values:
+                consistency_head.queue.enqueue(torch.cat(queued_values, dim=0))
+            optimizer_steps += 1
+        else:
+            queued_values.clear()
+            optimizer_step_skips += 1
     if not metric_values:
         raise ValueError("two-view loader produced no batches")
     count = float(len(metric_values))
@@ -545,6 +564,8 @@ def train_two_view_epoch(
         phase_health["gradient_norm_mean"] = sum(gradient_norms) / len(gradient_norms)
         phase_health["gradient_norm_max"] = max(gradient_norms)
     phase_health["learning_rate"] = float(optimizer.param_groups[0]["lr"])
+    phase_health["optimizer_steps"] = float(optimizer_steps)
+    phase_health["optimizer_step_skips"] = float(optimizer_step_skips)
     if scaler is not None and amp and device.type == "cuda":
         phase_health["amp_scale"] = float(scaler.get_scale())
     metrics = EpochMetrics(
@@ -671,13 +692,14 @@ def save_checkpoint(
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_metadata = {**artifact_version_metadata(), **dict(metadata or {})}
     payload = {
         "format_version": 1,
         "epoch": int(epoch),
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
         "metrics": dict(metrics),
-        "metadata": dict(metadata or {}),
+        "metadata": checkpoint_metadata,
         "extra_state": dict(extra_state or {}),
     }
     file_descriptor, temporary_name = tempfile.mkstemp(
@@ -707,6 +729,7 @@ def load_checkpoint(
     payload = torch.load(Path(path), map_location=map_location, weights_only=False)
     if payload.get("format_version") != 1:
         raise ValueError("unsupported checkpoint format")
+    require_artifact_versions(payload.get("metadata", {}), artifact_name="checkpoint")
     model.load_state_dict(payload["model"])
     if optimizer is not None and payload.get("optimizer") is not None:
         optimizer.load_state_dict(payload["optimizer"])

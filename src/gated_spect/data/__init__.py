@@ -1,6 +1,6 @@
 """Data ingestion, exposure, pairing, and split utilities."""
 
-from .cache import read_sample_cache, write_sample_cache
+from .cache import StaleCacheError, read_sample_cache, write_sample_cache
 from .audit import audit_root
 from .dicom_reader import read_nm_dicom
 from .dicom_export import write_nm_projection_dicom
@@ -37,6 +37,7 @@ __all__ = [
     "read_nm_dicom",
     "write_nm_projection_dicom",
     "read_sample_cache",
+    "StaleCacheError",
     "verify_pair",
     "write_pair_manifest",
     "write_jsonl",

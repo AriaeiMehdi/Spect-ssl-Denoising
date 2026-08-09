@@ -19,6 +19,7 @@ from .consistency import (
     pool_gate_bottleneck,
     stop_gradient_cosine_loss,
     variance_floor_loss,
+    covariance_offdiagonal_loss,
 )
 
 __all__ = [
@@ -38,4 +39,5 @@ __all__ = [
     "pool_gate_bottleneck",
     "stop_gradient_cosine_loss",
     "variance_floor_loss",
+    "covariance_offdiagonal_loss",
 ]

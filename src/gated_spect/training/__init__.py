@@ -17,7 +17,11 @@ from .runner import (
     train_epoch,
     train_two_view_epoch,
 )
-from .consistency_steps import TwoViewPretrainingLoss, two_view_pretraining_step
+from .consistency_steps import (
+    TwoViewPretrainingLoss,
+    optimizer_step_succeeded,
+    two_view_pretraining_step,
+)
 
 __all__ = [
     "DenoisingLoss",
@@ -34,5 +38,6 @@ __all__ = [
     "train_epoch",
     "train_two_view_epoch",
     "TwoViewPretrainingLoss",
+    "optimizer_step_succeeded",
     "two_view_pretraining_step",
 ]

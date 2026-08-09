@@ -12,6 +12,16 @@ from typing import Any
 import numpy as np
 
 from ..types import GatedSPECTSample
+from ..versioning import (
+    CANONICAL_CACHE_SCHEMA_VERSION,
+    EXPOSURE_SEMANTICS_VERSION,
+    IncompatibleArtifactError,
+    SCIENTIFIC_SEMANTICS_VERSION,
+)
+
+
+class StaleCacheError(IncompatibleArtifactError):
+    """Raised when a cache was created under incompatible semantics."""
 
 
 def _sha256(path: Path) -> str:
@@ -36,6 +46,13 @@ def write_sample_cache(sample: GatedSPECTSample, root: str | Path) -> Path:
         existing_checksums = final / "checksums.json"
         if not existing_checksums.exists():
             raise FileExistsError(f"cache directory exists without checksums: {final}")
+        metadata_path = final / "metadata.json"
+        if not metadata_path.exists():
+            raise StaleCacheError(
+                f"cache {final} has no semantics version; preserve it and regenerate under cache_v2"
+            )
+        existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        _validate_cache_versions(existing_metadata, final)
         expected = json.loads(existing_checksums.read_text(encoding="utf-8"))
         for name, checksum in expected.items():
             if not (final / name).exists() or _sha256(final / name) != checksum:
@@ -59,6 +76,9 @@ def write_sample_cache(sample: GatedSPECTSample, root: str | Path) -> Path:
             detector_spacing_mm=np.asarray(sample.detector_spacing_mm, dtype=np.float32),
         )
         metadata = {
+            "cache_schema_version": CANONICAL_CACHE_SCHEMA_VERSION,
+            "scientific_semantics_version": SCIENTIFIC_SEMANTICS_VERSION,
+            "exposure_semantics_version": EXPOSURE_SEMANTICS_VERSION,
             "sample_id": sample.sample_id,
             "patient_key": sample.patient_key,
             "study_key": sample.study_key,
@@ -99,12 +119,18 @@ def read_sample_cache(path: str | Path, *, mmap_counts: bool = True) -> GatedSPE
     """Read and verify a canonical cache directory."""
 
     directory = Path(path)
+    metadata_path = directory / "metadata.json"
+    if not metadata_path.exists():
+        raise StaleCacheError(
+            f"cache {directory} has no semantics version; regenerate it under cache_v2"
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    _validate_cache_versions(metadata, directory)
     checksums = json.loads((directory / "checksums.json").read_text(encoding="utf-8"))
     for name, expected in checksums.items():
         actual_path = directory / name
         if not actual_path.exists() or _sha256(actual_path) != expected:
             raise IOError(f"cache checksum mismatch for {actual_path}")
-    metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
     geometry = np.load(directory / "geometry.npz")
     return GatedSPECTSample(
         sample_id=str(metadata["sample_id"]),
@@ -130,3 +156,23 @@ def read_sample_cache(path: str | Path, *, mmap_counts: bool = True) -> GatedSPE
         source_path=str(metadata["source_path"]),
         metadata=metadata.get("metadata", {}),
     )
+
+
+def _validate_cache_versions(metadata: dict[str, Any], directory: Path) -> None:
+    expected = {
+        "cache_schema_version": CANONICAL_CACHE_SCHEMA_VERSION,
+        "scientific_semantics_version": SCIENTIFIC_SEMANTICS_VERSION,
+        "exposure_semantics_version": EXPOSURE_SEMANTICS_VERSION,
+    }
+    missing = [key for key in expected if key not in metadata]
+    incompatible = [
+        f"{key}={metadata.get(key)!r} (expected {value})"
+        for key, value in expected.items()
+        if key in metadata and int(metadata[key]) != value
+    ]
+    if missing or incompatible:
+        details = ", ".join(missing + incompatible)
+        raise StaleCacheError(
+            f"cache {directory} is incompatible with scientific semantics v2: {details}; "
+            "preserve the legacy cache and regenerate under cache_v2"
+        )

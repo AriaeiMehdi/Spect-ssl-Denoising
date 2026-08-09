@@ -14,6 +14,7 @@ import pydicom
 from ..types import ReaderConfig
 from .dicom_reader import read_nm_dicom, stable_identity_key
 from .splits import SplitConfig, make_dataset1_splits, make_dataset2_splits
+from ..versioning import artifact_version_metadata
 
 
 def _root_id(root: Path) -> str:
@@ -44,6 +45,7 @@ def build_acquisition_manifest(
         relative_path = str(path.relative_to(root_path))
         base: dict[str, Any] = {
             "dataset_id": dataset_id,
+            **artifact_version_metadata(),
             "relative_path": relative_path,
             "source_root_id": _root_id(root_path),
             "parse_status": "error",
@@ -60,6 +62,9 @@ def build_acquisition_manifest(
                 count_status = "exact" if int(expected_value) == total_counts else "mismatch"
             valid_frames = np.asarray(sample.valid_frames, dtype=bool)
             q = np.asarray(sample.relative_exposure_q, dtype=np.float64)
+            dwell = np.asarray(sample.view_dwell_s, dtype=np.float64)
+            frame_exposure = np.asarray(sample.frame_exposure_s, dtype=np.float64)
+            gate_to_view = frame_exposure.sum(axis=0) / np.clip(dwell, 1.0e-12, None)
             base.update(
                 {
                     "parse_status": "parsed",
@@ -71,6 +76,17 @@ def build_acquisition_manifest(
                     "shape": list(sample.shape),
                     "total_counts": total_counts,
                     "frame_exposure_total_s": float(np.asarray(sample.frame_exposure_s).sum()),
+                    "frame_exposure_min_s": float(frame_exposure[valid_frames].min()) if valid_frames.any() else 0.0,
+                    "frame_exposure_median_s": float(np.median(frame_exposure[valid_frames])) if valid_frames.any() else 0.0,
+                    "frame_exposure_max_s": float(frame_exposure[valid_frames].max()) if valid_frames.any() else 0.0,
+                    "view_dwell_source": str(sample.metadata.get("view_dwell_source", "unknown")),
+                    "actual_frame_duration_ms": sample.metadata.get("actual_frame_duration_ms"),
+                    "view_dwell_min_s": float(dwell.min()),
+                    "view_dwell_median_s": float(np.median(dwell)),
+                    "view_dwell_max_s": float(dwell.max()),
+                    "gate_to_view_dwell_ratio_min": float(gate_to_view.min()),
+                    "gate_to_view_dwell_ratio_median": float(np.median(gate_to_view)),
+                    "gate_to_view_dwell_ratio_max": float(gate_to_view.max()),
                     "relative_exposure_q_min": float(q[valid_frames].min()) if valid_frames.any() else 0.0,
                     "low_information_frame_count": int(np.count_nonzero(valid_frames & (q < 0.20))),
                     "valid_frame_fraction": float(valid_frames.mean()),
@@ -143,6 +159,7 @@ def write_locked_splits(
         config=config,
     )
     payload = {
+        **artifact_version_metadata(),
         "algorithm": "grouped-stratified-v1",
         "seed": config.seed,
         "dataset2": dataset2_splits,
@@ -154,4 +171,3 @@ def write_locked_splits(
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
     return destination
-

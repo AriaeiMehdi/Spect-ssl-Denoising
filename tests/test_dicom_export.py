@@ -64,7 +64,7 @@ class DicomExportTests(unittest.TestCase):
                 source_path,
                 root / "derived.dcm",
                 counts,
-                frame_exposure_s=np.array([[1.0, 1.0]], dtype=np.float32),
+                view_dwell_s=np.array([[1.0, 1.0]], dtype=np.float32),
                 series_description="derived",
                 derivation_description="test",
                 series_number=901,
@@ -89,6 +89,83 @@ class DicomExportTests(unittest.TestCase):
             )
             self.assertEqual(derived.Units, "CNTS")
             self.assertEqual(derived[0x0011, 0x1003].value, "count_semantics=expected_counts")
+            self.assertEqual(list(derived.ImageType), ["DERIVED", "PRIMARY", "TOMO", "EMISSION"])
+            self.assertIn(derived.CountsAccumulated, (None, ""))
+            self.assertEqual(int(derived.RotationInformationSequence[0].ActualFrameDuration), 1000)
+            self.assertEqual(
+                derived.SourceImageSequence[0].ReferencedSOPInstanceUID,
+                source.SOPInstanceUID,
+            )
+            self.assertEqual(derived.SourceImageSequence[0].SpatialLocationsPreserved, "YES")
+            self.assertEqual(derived[0x0011, 0x1007].value, "scientific_semantics_version=2")
+
+    def test_export_rejects_gated_stack_until_gated_semantics_are_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "source.dcm"
+            meta = FileMetaDataset()
+            meta.MediaStorageSOPClassUID = NuclearMedicineImageStorage
+            meta.MediaStorageSOPInstanceUID = generate_uid()
+            meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            meta.ImplementationClassUID = generate_uid()
+            source = FileDataset(str(source_path), {}, file_meta=meta, preamble=b"\0" * 128)
+            source.SOPClassUID = NuclearMedicineImageStorage
+            source.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+            source.Rows = 1
+            source.Columns = 1
+            source.SamplesPerPixel = 1
+            source.PhotometricInterpretation = "MONOCHROME2"
+            source.BitsAllocated = 16
+            source.BitsStored = 16
+            source.HighBit = 15
+            source.PixelRepresentation = 0
+            source.PixelData = np.array([[1]], dtype=np.uint16).tobytes()
+            source.save_as(source_path, write_like_original=False)
+            with self.assertRaises(NotImplementedError):
+                write_nm_projection_dicom(
+                    source_path,
+                    root / "derived.dcm",
+                    np.ones((2, 1, 1, 1), dtype=np.float32),
+                    view_dwell_s=np.ones((2, 1), dtype=np.float32),
+                    series_description="derived",
+                    derivation_description="test",
+                    series_number=902,
+                    expected_counts=True,
+                    provenance="independent",
+                )
+
+    def test_export_rejects_nonuniform_view_dwell(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_path = root / "source.dcm"
+            meta = FileMetaDataset()
+            meta.MediaStorageSOPClassUID = NuclearMedicineImageStorage
+            meta.MediaStorageSOPInstanceUID = generate_uid()
+            meta.TransferSyntaxUID = ExplicitVRLittleEndian
+            meta.ImplementationClassUID = generate_uid()
+            source = FileDataset(str(source_path), {}, file_meta=meta, preamble=b"\0" * 128)
+            source.SOPClassUID = NuclearMedicineImageStorage
+            source.SOPInstanceUID = meta.MediaStorageSOPInstanceUID
+            source.Rows = source.Columns = 1
+            source.SamplesPerPixel = 1
+            source.PhotometricInterpretation = "MONOCHROME2"
+            source.BitsAllocated = source.BitsStored = 16
+            source.HighBit = 15
+            source.PixelRepresentation = 0
+            source.PixelData = np.array([[1]], dtype=np.uint16).tobytes()
+            source.save_as(source_path, write_like_original=False)
+            with self.assertRaises(ValueError):
+                write_nm_projection_dicom(
+                    source_path,
+                    root / "derived.dcm",
+                    np.ones((1, 2, 1, 1), dtype=np.float32),
+                    view_dwell_s=np.array([[1.0, 1.2]], dtype=np.float32),
+                    series_description="derived",
+                    derivation_description="test",
+                    series_number=903,
+                    expected_counts=True,
+                    provenance="independent",
+                )
 
 
 if __name__ == "__main__":

@@ -2,7 +2,12 @@ import unittest
 
 import torch
 
-from gated_spect.models import ProjectionBackbone, ProjectionDenoiser
+from gated_spect.models import (
+    ProjectionBackbone,
+    ProjectionDenoiser,
+    pool_global_bottleneck,
+    standardized_log_exposure,
+)
 
 
 def _batch(batch_size: int = 1, gates: int = 2, views: int = 3) -> dict[str, torch.Tensor]:
@@ -20,6 +25,21 @@ def _batch(batch_size: int = 1, gates: int = 2, views: int = 3) -> dict[str, tor
 
 
 class ModelContractTests(unittest.TestCase):
+    def test_exposure_conditioning_is_clipped_and_shared_transform_is_finite(self) -> None:
+        exposure = torch.tensor([1.0e-20, 1.0, 1.0e20])
+        transformed = standardized_log_exposure(exposure, 0.0, 1.0)
+        self.assertTrue(torch.all(transformed <= 8.0))
+        self.assertTrue(torch.all(transformed >= -8.0))
+        self.assertTrue(torch.isfinite(transformed).all())
+        self.assertGreaterEqual(float(standardized_log_exposure(exposure, 0.0, 1.0).numel()), 1)
+
+    def test_global_pool_is_mean_over_valid_spatial_tokens(self) -> None:
+        values = torch.arange(1.0, 1.0 + 2 * 1 * 2 * 1 * 2 * 2).reshape(2, 1, 2, 1, 2, 2)
+        valid = torch.tensor([[[True, False]], [[True, True]]])
+        pooled = pool_global_bottleneck(values, valid)
+        expected = torch.tensor([[2.5], [12.5]])
+        torch.testing.assert_close(pooled, expected)
+
     def test_shapes_and_positive_rates(self) -> None:
         torch.manual_seed(3)
         model = ProjectionDenoiser().eval()
@@ -28,6 +48,7 @@ class ModelContractTests(unittest.TestCase):
         self.assertEqual(tuple(output.rate.shape), (2, 3, 4, 64, 64))
         self.assertEqual(tuple(output.conditioning.shape), (2, 3, 4, 8, 64, 64))
         self.assertEqual(tuple(output.global_representation.shape), (2, 256))
+        self.assertIsNotNone(output.exposure_clip_fraction)
         self.assertTrue(torch.isfinite(output.rate).all())
         self.assertTrue(torch.all(output.rate > 0))
 

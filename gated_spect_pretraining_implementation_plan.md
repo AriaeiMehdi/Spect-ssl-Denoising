@@ -382,6 +382,11 @@ The immutable statistical target remains integer counts. The input channels are:
 
 Compute one scalar mean and standard deviation for log1p counts over all eligible Dataset 1 training bins and one scalar pair for log exposure over eligible frames, using a streaming float64 Welford accumulator. Write them to normalization.json with sample-manifest checksum and eligible element counts. Standardized network channels are clipped to [-8,8]. Exposure is clipped only at 1e-6 before the log transform; likelihood exposure is not standardized or clipped.
 
+The Dataset 2 residual baseline uses a configurable positive pseudocount
+\(\alpha\) in \((y_{low}+\alpha)/E_{low}\). It is recorded in every denoising
+checkpoint and selected by a matched validation ablation (planned values
+\(0.5, 0.1, 0.01, 0.001\)); it is not assumed to be physically optimal.
+
 No geometric flip, arbitrary image rotation, or view reversal is allowed as augmentation because those operations change acquisition geometry. Count thinning and masking are the default augmentations.
 
 ---
@@ -498,6 +503,19 @@ Frame construction:
 G and V are derived from validated index labels. The expected [16,32,64,64] shape is a protocol check, not a parser assumption.
 
 If RescaleSlope/Intercept are present, accepted raw-count data require slope 1 and intercept 0. Any other transform is quarantined until its count semantics are documented.
+
+For NM Tomographic Acquisition, `RotationInformationSequence.ActualFrameDuration`
+is the nominal acquisition time per angular position in milliseconds, not the
+total rotation duration. A scalar 10,000 ms value with 32 views therefore
+produces 10 s in every element of `view_dwell_s` (sum 320 s). The gated
+effective `frame_exposure_s[G,V]` remains a separate quantity whose gate sum is
+compared with `view_dwell_s[V]`.
+
+Derived projection export is initially validated only for ungated `G=1` data.
+It writes `ImageType=DERIVED\\PRIMARY\\TOMO\\EMISSION`, new SOP/Series UIDs,
+`SourceImageSequence` with spatial preservation, and per-view
+`ActualFrameDuration`. Expected model counts leave `CountsAccumulated` empty;
+they are never labeled as acquired scanner totals.
 
 ### 8.2 Angle and detector orientation
 
@@ -692,7 +710,7 @@ For each raw bin \(y\):
 
 with one \(p\sim U(0.4,0.7)\) per acquisition per epoch.
 
-Student input is \(y^{(a)}\) with exposure \(pE\). The prediction target is \(y^{(b)}\) with exposure \((1-p)E\). A fresh split is generated in the dataset worker every epoch from a deterministic seed derived from global seed, epoch, sample ID, and worker ID.
+Student input is \(y^{(a)}\) with exposure \(pE\). The prediction target is \(y^{(b)}\) with exposure \((1-p)E\). A fresh split is generated every training epoch from a deterministic seed derived from global seed, epoch, sample ID, and augmentation-stream identity (`student_a`, `student_b`, or `teacher`). DataLoader worker assignment MUST NOT affect the scientific seed. Pretraining epoch-mutating datasets use `persistent_workers=False`; validation uses a fixed augmentation epoch/seed of 0.
 
 Required tests:
 
@@ -747,7 +765,8 @@ For predicted rate \(\hat r\):
 - Create two independently thinned and masked inputs.
 - Pass their 256-dimensional global representations through a two-layer projection MLP and predictor MLP using LayerNorm, never BatchNorm.
 - Use symmetric stop-gradient cosine loss as in a SimSiam-style objective.
-- Maintain a FIFO queue of the previous 127 stop-gradient projected representations and combine it with the current representation for the variance estimate.
+- Maintain a FIFO queue of the previous 2048 stop-gradient projected representations and combine it with the current representation for the variance estimate.
+- Monitor covariance/SVD effective rank, participation rank, rank fraction, component standard deviations, and off-diagonal correlation. An optional covariance off-diagonal penalty is configured explicitly.
 - After the queue contains at least 31 entries, add \(\operatorname{mean}(\max(0,0.1-\operatorname{std}(z)))\); before then the variance term is zero.
 - Update the queue only after a successful optimizer step and store/restore it in training checkpoints. In distributed training, all-gather the newly detached representations before queue insertion.
 

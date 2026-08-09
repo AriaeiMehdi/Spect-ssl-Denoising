@@ -21,7 +21,7 @@ class ExposureTests(unittest.TestCase):
             np.full(views, 2.0),
             config=ExposureConfig(low_information_q=0.20),
         )
-        self.assertEqual(result.source, "derived")
+        self.assertEqual(result.source, "count_based_gate_occupancy")
         np.testing.assert_allclose(result.frame_exposure_s.sum(axis=0), 2.0, rtol=1e-6)
         self.assertTrue(np.any(result.relative_exposure_q[3] < 0.20))
         self.assertTrue(result.stable_gates == (0, 1, 2))
@@ -30,7 +30,7 @@ class ExposureTests(unittest.TestCase):
         counts = np.ones((2, 3, 2, 2), dtype=np.int32)
         vendor = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
         result = estimate_exposure(counts, [1.0, 1.0, 1.0], vendor_exposure_s=vendor)
-        self.assertEqual(result.source, "vendor")
+        self.assertEqual(result.source, "vendor_live_time")
         np.testing.assert_array_equal(result.frame_exposure_s, vendor.astype(np.float32))
 
     def test_invalid_dwell_is_rejected(self) -> None:

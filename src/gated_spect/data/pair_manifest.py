@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from ..types import PairProvenance, ReaderConfig
 from .dicom_reader import read_nm_dicom, stable_identity_key
 from .pairing import verify_pair
+from ..versioning import artifact_version_metadata
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ def audit_duration_pairs(
     for key in incomplete:
         rows.append(
             {
+                **artifact_version_metadata(),
                 "pair_id": stable_identity_key(key, label="pair", config=config),
                 "accepted": False,
                 "provenance": PairProvenance.INDEPENDENT.value,
@@ -77,6 +79,7 @@ def audit_duration_pairs(
             )
             rows.append(
                 {
+                    **artifact_version_metadata(),
                     "pair_id": stable_identity_key(pair.pair_key, label="pair", config=config),
                     "patient_key": low.patient_key,
                     "low_sample_key": stable_identity_key(low.sample_id, label="sample", config=config),
@@ -92,6 +95,7 @@ def audit_duration_pairs(
         except Exception as exc:
             rows.append(
                 {
+                    **artifact_version_metadata(),
                     "pair_id": stable_identity_key(pair.pair_key, label="pair", config=config),
                     "accepted": False,
                     "provenance": PairProvenance.INDEPENDENT.value,

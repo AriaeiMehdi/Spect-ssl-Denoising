@@ -39,7 +39,7 @@ def stop_gradient_cosine_loss(prediction: Tensor, target: Tensor) -> Tensor:
 class RepresentationQueue(nn.Module):
     """FIFO queue of detached projected representations for variance regularization."""
 
-    def __init__(self, dimension: int = 256, capacity: int = 127) -> None:
+    def __init__(self, dimension: int = 256, capacity: int = 2048) -> None:
         super().__init__()
         if dimension < 1 or capacity < 1:
             raise ValueError("queue dimension and capacity must be positive")
@@ -91,11 +91,25 @@ def variance_floor_loss(
     return F.relu(float(target_std) - standard_deviation).mean()
 
 
+def covariance_offdiagonal_loss(projected: Tensor) -> Tensor:
+    """Penalize correlated feature dimensions using a centered covariance matrix."""
+
+    if projected.ndim != 2:
+        raise ValueError("projected must have shape [N,D]")
+    if projected.shape[0] < 2:
+        return projected.new_zeros(())
+    centered = projected.float() - projected.float().mean(dim=0, keepdim=True)
+    covariance = centered.transpose(0, 1).matmul(centered) / float(projected.shape[0] - 1)
+    off_diagonal = covariance - torch.diag_embed(torch.diagonal(covariance))
+    return off_diagonal.square().mean().to(dtype=projected.dtype)
+
+
 @dataclass(frozen=True)
 class GlobalConsistencyLoss:
     total: Tensor
     cosine: Tensor
     variance: Tensor
+    covariance: Tensor
     projected_a: Tensor
     projected_b: Tensor
 
@@ -103,11 +117,19 @@ class GlobalConsistencyLoss:
 class GlobalConsistencyHead(nn.Module):
     """Projection/prediction heads and queue-backed SimSiam objective."""
 
-    def __init__(self, dimension: int = 256) -> None:
+    def __init__(
+        self,
+        dimension: int = 256,
+        queue_capacity: int = 2048,
+        covariance_loss_weight: float = 0.0,
+    ) -> None:
         super().__init__()
         self.projector = LayerNormMLP(dimension, dimension, dimension)
         self.predictor = LayerNormMLP(dimension, dimension, dimension)
-        self.queue = RepresentationQueue(dimension=dimension, capacity=127)
+        self.queue = RepresentationQueue(dimension=dimension, capacity=queue_capacity)
+        if covariance_loss_weight < 0:
+            raise ValueError("covariance_loss_weight must be nonnegative")
+        self.covariance_loss_weight = float(covariance_loss_weight)
 
     def forward(self, representation_a: Tensor, representation_b: Tensor) -> GlobalConsistencyLoss:
         projected_a = self.projector(representation_a)
@@ -119,10 +141,12 @@ class GlobalConsistencyHead(nn.Module):
             + stop_gradient_cosine_loss(predicted_b, projected_a)
         )
         variance = variance_floor_loss(torch.cat((projected_a, projected_b), dim=0), self.queue)
+        covariance = covariance_offdiagonal_loss(torch.cat((projected_a, projected_b), dim=0))
         return GlobalConsistencyLoss(
-            total=cosine + variance,
+            total=cosine + variance + self.covariance_loss_weight * covariance,
             cosine=cosine,
             variance=variance,
+            covariance=covariance,
             projected_a=projected_a,
             projected_b=projected_b,
         )

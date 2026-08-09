@@ -12,6 +12,7 @@ from gated_spect.losses import (
 )
 from gated_spect.models import ProjectionDenoiser
 from gated_spect.training import train_two_view_epoch, two_view_pretraining_step
+from gated_spect.training.consistency_steps import _representation_health
 
 
 def _view(*, hidden_gate: bool = False) -> dict[str, torch.Tensor]:
@@ -45,6 +46,27 @@ def _view(*, hidden_gate: bool = False) -> dict[str, torch.Tensor]:
 
 
 class ConsistencyTests(unittest.TestCase):
+    def test_covariance_spectrum_rank_detects_duplicate_features(self) -> None:
+        queue = RepresentationQueue(dimension=256, capacity=2048)
+        values = torch.randn(64, 1).repeat(1, 256)
+        health = _representation_health(values, queue)
+        self.assertAlmostEqual(float(health["representation_effective_rank"]), 1.0, delta=1e-4)
+        self.assertAlmostEqual(float(health["representation_participation_rank"]), 1.0, delta=1e-4)
+        self.assertGreater(float(health["mean_absolute_offdiagonal_correlation"]), 0.99)
+
+    def test_queue_default_supports_full_representation(self) -> None:
+        self.assertEqual(RepresentationQueue(dimension=256).capacity, 2048)
+        independent = torch.randn(512, 256)
+        health = _representation_health(independent, RepresentationQueue(dimension=256))
+        self.assertGreater(float(health["representation_effective_rank_fraction"]), 0.5)
+
+    def test_covariance_loss_distinguishes_correlated_features(self) -> None:
+        from gated_spect.losses import covariance_offdiagonal_loss
+
+        independent = covariance_offdiagonal_loss(torch.randn(128, 8))
+        duplicate = covariance_offdiagonal_loss(torch.randn(128, 1).repeat(1, 8))
+        self.assertLess(float(independent), float(duplicate))
+
     def test_queue_and_variance_warmup(self) -> None:
         queue = RepresentationQueue(dimension=4, capacity=5)
         projected = torch.randn(2, 4)

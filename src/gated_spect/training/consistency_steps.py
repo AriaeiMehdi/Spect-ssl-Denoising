@@ -31,16 +31,38 @@ class TwoViewPretrainingLoss:
 
 
 def _representation_health(projected: Tensor, queue: Any) -> dict[str, Tensor]:
-    """Compute collapse diagnostics from the current projections and FIFO queue."""
+    """Compute covariance-spectrum and correlation collapse diagnostics."""
 
     queue_values = queue.values().detach().to(device=projected.device, dtype=projected.dtype)
     values = torch.cat((queue_values, projected.detach()), dim=0).float()
+    if values.ndim != 2 or values.shape[0] == 0:
+        raise ValueError("representation values must have shape [N,D] with N > 0")
     component_std = values.std(dim=0, unbiased=False)
     component_variance = component_std.square()
-    probability = component_variance / component_variance.sum().clamp_min(1.0e-12)
-    effective_rank = torch.exp(
-        -(probability.clamp_min(1.0e-12) * probability.clamp_min(1.0e-12).log()).sum()
-    )
+    centered = values - values.mean(dim=0, keepdim=True)
+    if values.shape[0] > 1:
+        singular_values = torch.linalg.svdvals(centered)
+        eigenvalues = singular_values.square()
+        spectrum_total = eigenvalues.sum()
+        probability = eigenvalues / spectrum_total.clamp_min(1.0e-12)
+        effective_rank = torch.exp(
+            -(probability.clamp_min(1.0e-12) * probability.clamp_min(1.0e-12).log()).sum()
+        )
+        participation_rank = spectrum_total.square() / eigenvalues.square().sum().clamp_min(1.0e-12)
+        rank_denominator = float(min(values.shape[1], max(values.shape[0] - 1, 1)))
+        rank_fraction = effective_rank / rank_denominator
+        covariance = centered.transpose(0, 1).matmul(centered) / float(values.shape[0] - 1)
+        standard_deviation = covariance.diagonal().clamp_min(1.0e-12).sqrt()
+        correlation = covariance / (standard_deviation[:, None] * standard_deviation[None, :]).clamp_min(1.0e-12)
+        off_diagonal = ~torch.eye(values.shape[1], dtype=torch.bool, device=values.device)
+        absolute_off_diagonal = correlation.abs()[off_diagonal]
+        if absolute_off_diagonal.numel() == 0:
+            absolute_off_diagonal = values.new_zeros((1,))
+    else:
+        effective_rank = values.new_zeros(())
+        participation_rank = values.new_zeros(())
+        rank_fraction = values.new_zeros(())
+        absolute_off_diagonal = values.new_zeros((1,))
     norms = values.norm(dim=1)
     return {
         "representation_mean": values.mean(),
@@ -51,7 +73,16 @@ def _representation_health(projected: Tensor, queue: Any) -> dict[str, Tensor]:
         "representation_component_std_min": component_std.amin(),
         "representation_component_std_max": component_std.amax(),
         "representation_effective_rank": effective_rank,
+        "representation_participation_rank": participation_rank,
+        "representation_effective_rank_fraction": rank_fraction,
+        "mean_absolute_offdiagonal_correlation": absolute_off_diagonal.mean(),
+        "p95_absolute_offdiagonal_correlation": torch.quantile(absolute_off_diagonal, 0.95),
+        "max_absolute_offdiagonal_correlation": absolute_off_diagonal.amax(),
+        "minimum_component_std": component_std.amin(),
+        "median_component_std": component_std.median(),
+        "maximum_component_std": component_std.amax(),
         "queue_size": projected.new_tensor(float(queue.num_entries)),
+        "queue_ready": projected.new_tensor(float(queue.num_entries >= 512)),
     }
 
 
@@ -62,6 +93,23 @@ def _student_masked_gate(batch: Mapping[str, Any]) -> Tensor:
     # A gate is considered hidden only when every detector bin in every view is
     # invisible.  Partial view/patch masks do not create a gate-consistency target.
     return ~visibility.any(dim=(2, 3, 4))
+
+
+def optimizer_step_succeeded(
+    optimizer: torch.optim.Optimizer,
+    *,
+    scaler: torch.amp.GradScaler | None,
+    autocast_enabled: bool,
+) -> bool:
+    """Step an optimizer and report whether AMP skipped it due to overflow."""
+
+    if scaler is not None and autocast_enabled:
+        old_scale = float(scaler.get_scale())
+        scaler.step(optimizer)
+        scaler.update()
+        return float(scaler.get_scale()) >= old_scale
+    optimizer.step()
+    return True
 
 
 def two_view_pretraining_step(
@@ -133,24 +181,41 @@ def two_view_pretraining_step(
             if key in loss_b.health
         }
         health.update(_representation_health(torch.cat((global_loss.projected_a, global_loss.projected_b), dim=0), consistency_head.queue))
+        health["covariance_offdiagonal_loss"] = global_loss.covariance.detach()
+        clip_values = [
+            value
+            for value in (
+                getattr(student_a, "exposure_clip_fraction", None),
+                getattr(student_b, "exposure_clip_fraction", None),
+            )
+            if value is not None
+        ]
+        if clip_values:
+            health["exposure_conditioning_clip_fraction"] = torch.stack(clip_values).mean().detach()
         health["latent_similarity"] = 1.0 - global_loss.cosine.detach()
     if not torch.isfinite(total):
         raise FloatingPointError("non-finite two-view self-supervised loss")
     if optimizer is not None:
+        successful_step = True
         if scaler is not None and autocast_enabled:
             scaler.scale(total).backward()
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(list(model.parameters()) + list(consistency_head.parameters()), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            successful_step = optimizer_step_succeeded(
+                optimizer, scaler=scaler, autocast_enabled=autocast_enabled
+            )
         else:
             total.backward()
             nn.utils.clip_grad_norm_(list(model.parameters()) + list(consistency_head.parameters()), 1.0)
-            optimizer.step()
-        ema_teacher.update(model.backbone)
-        consistency_head.queue.enqueue(
-            torch.cat((global_loss.projected_a.detach(), global_loss.projected_b.detach()), dim=0)
-        )
+            successful_step = optimizer_step_succeeded(
+                optimizer, scaler=None, autocast_enabled=False
+            )
+        if successful_step:
+            ema_teacher.update(model.backbone)
+            consistency_head.queue.enqueue(
+                torch.cat((global_loss.projected_a.detach(), global_loss.projected_b.detach()), dim=0)
+            )
+        health["optimizer_step_succeeded"] = total.new_tensor(float(successful_step))
     return TwoViewPretrainingLoss(
         total=total,
         masked=masked,

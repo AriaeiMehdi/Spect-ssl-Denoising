@@ -205,26 +205,41 @@ def _get_radii(
     return np.full(num_views, np.nan, dtype=np.float64), np.zeros(num_views, dtype=bool), "missing"
 
 
-def _get_view_dwell(ds: Dataset, num_views: int, config: ReaderConfig) -> np.ndarray:
+def _get_view_dwell(
+    ds: Dataset, num_views: int, config: ReaderConfig
+) -> tuple[np.ndarray, str, float | None]:
     value = _first_value(ds, ("AngularViewDwellTime", "ViewDwellTime"))
+    source = "angular_view_dwell"
     from_total_stop = False
     if value is None:
         value = _first_value(ds, ("AngularStopDuration",))
         from_total_stop = value is not None
-    from_rotation_duration_ms = False
+        if from_total_stop:
+            source = "angular_stop_duration"
+    from_actual_frame_duration_ms = False
     if value is None:
         value = _nested_value(ds, "RotationInformationSequence", ("ActualFrameDuration",))
-        from_rotation_duration_ms = value is not None
+        from_actual_frame_duration_ms = value is not None
+        if from_actual_frame_duration_ms:
+            source = "dicom_actual_frame_duration"
     if value is None:
         if config.default_view_dwell_s is None or config.default_view_dwell_s <= 0:
             raise UnresolvedGeometryError("view dwell time is missing")
-        return np.full(num_views, float(config.default_view_dwell_s), dtype=np.float64)
+        return (
+            np.full(num_views, float(config.default_view_dwell_s), dtype=np.float64),
+            "configured_default",
+            None,
+        )
     arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    raw_actual_frame_duration_ms = float(arr[0]) if from_actual_frame_duration_ms and arr.size else None
     if arr.size == 1:
         if from_total_stop:
             arr = arr / num_views
-        if from_rotation_duration_ms:
-            arr = arr / 1000.0 / num_views
+        if from_actual_frame_duration_ms:
+            # NM Tomographic Acquisition ActualFrameDuration is the nominal
+            # acquisition time at each angular position, not total rotation
+            # time.  Do not divide it by the number of views.
+            arr = arr / 1000.0
         arr = np.repeat(arr, num_views)
     if arr.size != num_views:
         raise UnresolvedGeometryError(f"view dwell must have {num_views} values, got {arr.size}")
@@ -232,7 +247,7 @@ def _get_view_dwell(ds: Dataset, num_views: int, config: ReaderConfig) -> np.nda
         raise UnresolvedGeometryError("view dwell values must be finite and positive")
     # DICOM exports encountered in this project use seconds for AngularStopDuration.
     # Unit conversion is intentionally not guessed for arbitrary private keywords.
-    return arr
+    return arr, source, raw_actual_frame_duration_ms
 
 
 def _get_energy_window(ds: Dataset, config: ReaderConfig) -> tuple[float, float]:
@@ -323,7 +338,9 @@ def read_nm_dicom(path: str | Path, config: ReaderConfig = ReaderConfig()) -> Ga
     angles_rad = np.deg2rad(start_deg + sign * step_deg * np.arange(frame_index.num_views))
     spacing = _get_spacing(ds, config)
     radii_mm, radius_valid, radius_source = _get_radii(ds, frame_index.num_views, config)
-    view_dwell_s = _get_view_dwell(ds, frame_index.num_views, config)
+    view_dwell_s, view_dwell_source, actual_frame_duration_ms = _get_view_dwell(
+        ds, frame_index.num_views, config
+    )
     phase, phase_source = _get_gate_phase(ds, frame_index.num_gates)
 
     valid = np.ones((frame_index.num_gates, frame_index.num_views), dtype=bool)
@@ -398,6 +415,8 @@ def read_nm_dicom(path: str | Path, config: ReaderConfig = ReaderConfig()) -> Ga
     geometry_hash = _canonical_geometry_hash(geometry_payload)
     metadata = {
         "angle_source": angle_source,
+        "view_dwell_source": view_dwell_source,
+        "actual_frame_duration_ms": actual_frame_duration_ms,
         "phase_source": phase_source,
         "gating_mode": gating_mode,
         "radius_source": radius_source,

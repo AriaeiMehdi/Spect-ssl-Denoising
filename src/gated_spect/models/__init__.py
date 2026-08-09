@@ -5,6 +5,8 @@ from .backbone import (
     ProjectionBackbone,
     ProjectionDenoiser,
     ProjectionOutput,
+    standardized_log_exposure,
+    pool_global_bottleneck,
 )
 from .unrolled import UnrolledOSEM, UnrolledOutput, VolumeRegularizer, denoise_then_osem
 
@@ -13,6 +15,8 @@ __all__ = [
     "ProjectionBackbone",
     "ProjectionDenoiser",
     "ProjectionOutput",
+    "standardized_log_exposure",
+    "pool_global_bottleneck",
     "UnrolledOSEM",
     "UnrolledOutput",
     "VolumeRegularizer",

@@ -23,6 +23,12 @@ class LossTests(unittest.TestCase):
         self.assertTrue(torch.all(first_a >= 0))
         self.assertTrue(torch.all(second_a >= 0))
 
+    def test_augmentation_seed_is_worker_independent_and_stream_specific(self) -> None:
+        worker_zero = count_split_seed(17, 3, "sample-a", "student_a")
+        worker_two = count_split_seed(17, 3, "sample-a", "student_a")
+        self.assertEqual(worker_zero, worker_two)
+        self.assertNotEqual(worker_zero, count_split_seed(17, 3, "sample-a", "student_b"))
+
     def test_binomial_samples_have_reasonable_mean(self) -> None:
         counts = torch.full((2000,), 100, dtype=torch.int64)
         samples = torch.stack(

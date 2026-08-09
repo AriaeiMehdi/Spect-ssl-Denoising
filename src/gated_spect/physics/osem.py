@@ -1,4 +1,8 @@
-"""Exposure-aware MLEM and OSEM for the reference projector."""
+"""Exposure-aware MLEM/OSEM for the *ideal mathematical* reference projector.
+
+This module is intentionally not a claim of validated clinical SPECT physics;
+geometry, orientation, attenuation, scatter, and CDR gates remain external.
+"""
 
 from __future__ import annotations
 

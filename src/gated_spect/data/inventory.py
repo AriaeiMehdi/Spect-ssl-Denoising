@@ -12,6 +12,7 @@ from pydicom.dataset import Dataset
 
 from ..types import ReaderConfig
 from .dicom_reader import stable_identity_key
+from ..versioning import artifact_version_metadata
 
 
 def _file_sha256(path: Path) -> str:
@@ -65,6 +66,7 @@ def inventory_headers(
         except Exception as exc:
             rows.append(
                 {
+                    **artifact_version_metadata(),
                     "dataset_id": dataset_id,
                     "relative_path": str(path.relative_to(relative_root)),
                     "parse_status": "unreadable",
@@ -86,6 +88,7 @@ def inventory_headers(
         )
         rows.append(
             {
+                **artifact_version_metadata(),
                 "dataset_id": dataset_id,
                 "relative_path": str(path.relative_to(relative_root)),
                 "source_sha256": _file_sha256(path),

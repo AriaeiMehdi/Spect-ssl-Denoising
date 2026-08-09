@@ -25,7 +25,8 @@ class RealDatasetSampleTests(unittest.TestCase):
         self.assertEqual(sample.metadata["gating_mode"], "ungated")
         self.assertEqual(sample.metadata["radius_source"], "detector_sequence")
         self.assertTrue(np.all(sample.radius_valid))
-        self.assertAlmostEqual(float(sample.view_dwell_s.sum()), 10.0, places=5)
+        np.testing.assert_allclose(sample.view_dwell_s, np.full(32, 10.0, dtype=np.float32))
+        self.assertEqual(sample.metadata["view_dwell_source"], "dicom_actual_frame_duration")
         self.assertEqual(sample.collimator_id, "LEHR")
 
     def test_pretraining_is_gated_with_valid_radius_sources(self) -> None:
@@ -37,7 +38,8 @@ class RealDatasetSampleTests(unittest.TestCase):
         self.assertEqual(sample.metadata["phase_source"], "slot_center")
         self.assertTrue(np.all(sample.radius_valid))
         self.assertTrue(np.isfinite(sample.energy_window_kev).all())
-        self.assertAlmostEqual(float(sample.view_dwell_s.sum()), 27.904, places=3)
+        self.assertAlmostEqual(float(np.median(sample.view_dwell_s)), 27.904, places=3)
+        self.assertEqual(sample.metadata["view_dwell_source"], "dicom_actual_frame_duration")
 
         detector_radius_sample = read_nm_dicom(candidates[1], self.config)
         self.assertTrue(np.all(detector_radius_sample.radius_valid))

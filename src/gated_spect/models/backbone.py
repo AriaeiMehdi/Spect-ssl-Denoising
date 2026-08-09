@@ -18,6 +18,35 @@ from torch.utils.checkpoint import checkpoint
 
 
 _EPS: Final[float] = 1.0e-6
+_EXPOSURE_CLIP: Final[float] = 8.0
+
+
+def standardized_log_exposure(
+    exposure_s: Tensor,
+    mean: float,
+    std: float,
+) -> Tensor:
+    """Return the bounded network conditioning transform for exposure.
+
+    Likelihood exposure tensors remain untouched; only neural conditioning is
+    standardized and clipped to the documented ``[-8, 8]`` range.
+    """
+
+    if std <= 0:
+        raise ValueError("exposure standard deviation must be positive")
+    value = (torch.log(exposure_s.to(dtype=torch.float32).clamp_min(_EPS)) - float(mean)) / float(std)
+    return value.clamp(min=-_EXPOSURE_CLIP, max=_EXPOSURE_CLIP)
+
+
+def pool_global_bottleneck(bottleneck_tokens: Tensor, valid_frames: Tensor) -> Tensor:
+    """Mean-pool valid spatial tokens and frames to ``[B, C]``."""
+
+    if bottleneck_tokens.ndim != 6 or valid_frames.shape != bottleneck_tokens.shape[:3]:
+        raise ValueError("bottleneck_tokens must be [B,G,V,C,H,W] with [B,G,V] validity")
+    frame_features = bottleneck_tokens.mean(dim=(-2, -1))
+    frame_weights = valid_frames.to(dtype=bottleneck_tokens.dtype)[..., None]
+    denominator = frame_weights.sum(dim=(1, 2)).clamp_min(1.0)
+    return (frame_features * frame_weights).sum(dim=(1, 2)) / denominator
 
 
 @dataclass(frozen=True)
@@ -29,6 +58,7 @@ class BackboneOutput:
     skip32: Tensor  # [B,G,V,48,H/2,W/2]
     skip64: Tensor  # [B,G,V,32,H,W]
     global_representation: Tensor  # [B,256]
+    exposure_clip_fraction: Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -38,6 +68,7 @@ class ProjectionOutput:
     rate: Tensor  # [B,G,V,H,W], counts per second
     conditioning: Tensor | None  # [B,G,V,8,H,W]
     global_representation: Tensor  # [B,256]
+    exposure_clip_fraction: Tensor | None = None
 
 
 class ResidualBlock(nn.Module):
@@ -306,8 +337,9 @@ class ProjectionBackbone(nn.Module):
         radius = torch.nan_to_num(radii_mm, nan=self.radius_mean_mm)
         radius = ((radius - self.radius_mean_mm) / self.radius_std_mm)[:, None, :].expand(b, g, v)
         phase = gate_phase_rad[:, :, None].expand(b, g, v)
-        log_exposure = torch.log(input_exposure_s.clamp_min(_EPS))
-        log_exposure = (log_exposure - self.log_exposure_mean) / self.log_exposure_std
+        log_exposure = standardized_log_exposure(
+            input_exposure_s, self.log_exposure_mean, self.log_exposure_std
+        )
         fraction = split_fraction.reshape(b, 1, 1).expand(b, g, v)
         continuous = torch.stack(
             (
@@ -379,8 +411,15 @@ class ProjectionBackbone(nn.Module):
         exposure = input_exposure_s.to(dtype=counts_input.dtype)
         valid = valid_frames.to(dtype=counts_input.dtype)
         visible = visibility.to(dtype=counts_input.dtype)
-        log_exposure = torch.log(exposure.clamp_min(_EPS))
-        log_exposure = (log_exposure - self.log_exposure_mean) / self.log_exposure_std
+        raw_standardized_log_exposure = (
+            torch.log(exposure.clamp_min(_EPS)) - self.log_exposure_mean
+        ) / self.log_exposure_std
+        log_exposure = standardized_log_exposure(
+            exposure, self.log_exposure_mean, self.log_exposure_std
+        )
+        exposure_clip_fraction = (raw_standardized_log_exposure.abs() > _EXPOSURE_CLIP).to(
+            dtype=counts_input.dtype
+        ).mean()
         frame_input = torch.cat(
             (
                 counts_input,
@@ -416,9 +455,7 @@ class ProjectionBackbone(nn.Module):
         bottleneck_tokens = self._mix_angular(bottleneck_tokens, self.angular2, valid_frames)
         bottleneck_tokens = self._mix_temporal(bottleneck_tokens, self.temporal2, valid_frames)
 
-        token_valid = valid_frames.to(dtype=bottleneck_tokens.dtype)[..., None, None, None]
-        denominator = token_valid.sum(dim=(1, 2, 3, 4, 5), keepdim=False).clamp_min(1.0)
-        pooled = (bottleneck_tokens * token_valid).sum(dim=(1, 2, 4, 5)) / denominator[:, None]
+        pooled = pool_global_bottleneck(bottleneck_tokens, valid_frames)
         global_representation = self.global_projection(self.global_norm(pooled))
         return BackboneOutput(
             bottleneck=bottleneck_tokens,
@@ -426,6 +463,7 @@ class ProjectionBackbone(nn.Module):
             skip32=skip32_tokens,
             skip64=skip64_tokens,
             global_representation=global_representation,
+            exposure_clip_fraction=exposure_clip_fraction,
         )
 
 
@@ -563,4 +601,5 @@ class ProjectionDenoiser(nn.Module):
             rate=rate,
             conditioning=conditioning,
             global_representation=features.global_representation,
+            exposure_clip_fraction=features.exposure_clip_fraction,
         )

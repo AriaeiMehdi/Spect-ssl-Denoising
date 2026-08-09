@@ -90,7 +90,7 @@ def estimate_exposure(
         return ExposureResult(
             frame_exposure_s=exposure.astype(np.float32),
             relative_exposure_q=q.astype(np.float32),
-            source="vendor",
+            source="vendor_live_time",
             stable_gates=tuple(range(g)),
         )
 
@@ -140,7 +140,7 @@ def estimate_exposure(
     return ExposureResult(
         frame_exposure_s=exposure.astype(np.float32),
         relative_exposure_q=q.astype(np.float32),
-        source="derived",
+        source="count_based_gate_occupancy",
         stable_gates=tuple(int(x) for x in np.flatnonzero(stable)),
         warnings=tuple(warnings),
     )

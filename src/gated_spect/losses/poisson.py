@@ -10,10 +10,20 @@ import torch
 from torch import Tensor
 
 
-def count_split_seed(global_seed: int, epoch: int, sample_id: str, worker_id: int = 0) -> int:
-    """Derive a reproducible per-acquisition/per-epoch RNG seed."""
+def count_split_seed(
+    global_seed: int,
+    epoch: int,
+    sample_id: str,
+    augmentation_stream: str = "default",
+) -> int:
+    """Derive a worker-independent per-acquisition/per-epoch RNG seed.
 
-    payload = f"{int(global_seed)}|{int(epoch)}|{sample_id}|{int(worker_id)}".encode("utf-8")
+    The stream identifies the scientific view (for example ``student_a``,
+    ``student_b`` or ``teacher``).  DataLoader worker assignment is
+    deliberately absent from this contract.
+    """
+
+    payload = f"{int(global_seed)}|{int(epoch)}|{sample_id}|{str(augmentation_stream)}".encode("utf-8")
     # Torch generators accept signed 64-bit seeds.  Keep a nonzero value so a
     # malformed all-zero digest cannot accidentally select the default stream.
     seed = int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") & ((1 << 63) - 1)

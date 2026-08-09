@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import torch
+from gated_spect.versioning import IncompatibleArtifactError
 
 from gated_spect.models import ProjectionDenoiser
 from gated_spect.training import (
@@ -14,7 +15,9 @@ from gated_spect.training import (
     pretraining_step,
     save_checkpoint,
     train_epoch,
+    optimizer_step_succeeded,
 )
+from gated_spect.training.checkpoint_contract import validate_checkpoint_metadata
 
 
 def _batch() -> dict[str, torch.Tensor]:
@@ -44,6 +47,29 @@ def _batch() -> dict[str, torch.Tensor]:
 
 
 class TrainingStepTests(unittest.TestCase):
+    def test_amp_scale_drop_marks_optimizer_step_skipped(self) -> None:
+        class FakeScaler:
+            def __init__(self) -> None:
+                self.scale_value = 8.0
+
+            def get_scale(self) -> float:
+                return self.scale_value
+
+            def step(self, optimizer: torch.optim.Optimizer) -> None:
+                self.scale_value = 4.0
+
+            def update(self) -> None:
+                pass
+
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.SGD([parameter], lr=1.0)
+        parameter.grad = torch.tensor(1.0)
+        success = optimizer_step_succeeded(
+            optimizer, scaler=FakeScaler(), autocast_enabled=True
+        )
+        self.assertFalse(success)
+        self.assertEqual(float(parameter), 1.0)
+
     def test_one_batch_pretraining_and_denoising_steps_are_finite(self) -> None:
         torch.manual_seed(31)
         model = ProjectionDenoiser()
@@ -80,8 +106,41 @@ class TrainingStepTests(unittest.TestCase):
             payload = load_checkpoint(path, restored, restored_optimizer)
             self.assertEqual(payload["epoch"], 4)
             self.assertEqual(payload["metadata"]["seed"], 32)
+            self.assertEqual(payload["metadata"]["scientific_semantics_version"], 2)
             for left, right in zip(model.parameters(), restored.parameters()):
                 self.assertTrue(torch.equal(left, right))
+
+    def test_legacy_checkpoint_is_rejected_by_versioned_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.pt"
+            model = ProjectionDenoiser()
+            torch.save(
+                {
+                    "format_version": 1,
+                    "epoch": 0,
+                    "model": model.state_dict(),
+                    "optimizer": None,
+                    "metrics": {},
+                    "metadata": {},
+                    "extra_state": {},
+                },
+                path,
+            )
+            with self.assertRaises(IncompatibleArtifactError):
+                load_checkpoint(path, ProjectionDenoiser())
+
+    def test_legacy_backbone_transfer_requires_passing_migration_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "migration.json"
+            report.write_text('{"legacy_backbone_compatibility": true}', encoding="utf-8")
+            validate_checkpoint_metadata(
+                {}, allow_legacy_backbone_transfer=True, migration_report=report
+            )
+            report.write_text('{"legacy_backbone_compatibility": false}', encoding="utf-8")
+            with self.assertRaises(IncompatibleArtifactError):
+                validate_checkpoint_metadata(
+                    {}, allow_legacy_backbone_transfer=True, migration_report=report
+                )
 
     def test_gradient_accumulation_steps_optimizer_once_for_two_batches(self) -> None:
         torch.manual_seed(33)
