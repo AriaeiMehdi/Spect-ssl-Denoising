@@ -1510,6 +1510,10 @@ def main(argv: list[str] | None = None) -> int:
                 "source_checkpoint_scientific_semantics_version": int(
                     pretrained_metadata.get("scientific_semantics_version", 1)
                 ),
+                "source_scientific_semantics_version": int(
+                    pretrained_metadata.get("scientific_semantics_version", 1)
+                ),
+                "runtime_scientific_semantics_version": 2,
                 "exposure_migration_report": (
                     str(Path(args.exposure_migration_report).resolve())
                     if args.exposure_migration_report
@@ -1677,6 +1681,10 @@ def main(argv: list[str] | None = None) -> int:
                         "source_checkpoint_scientific_semantics_version": int(
                             pretrained_metadata.get("scientific_semantics_version", 1)
                         ),
+                        "source_scientific_semantics_version": int(
+                            pretrained_metadata.get("scientific_semantics_version", 1)
+                        ),
+                        "runtime_scientific_semantics_version": 2,
                         "exposure_migration_report": (
                             str(Path(args.exposure_migration_report).resolve())
                             if args.exposure_migration_report

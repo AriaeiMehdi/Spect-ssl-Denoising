@@ -101,6 +101,8 @@ def build_exposure_migration_report(
     geometry_same = True
     for dataset_id, root_value, records in datasets:
         root = Path(root_value).resolve()
+        if new_manifests is None or dataset_id not in new_manifests:
+            geometry_same = False
         new_by_sample = {
             str(row.get("sample_id")): row
             for row in (new_manifests or {}).get(dataset_id, [])
@@ -128,8 +130,12 @@ def build_exposure_migration_report(
                 all_delta.extend(np.abs(delta).tolist())
                 sample_key = str(record.get("sample_id", sample.sample_id))
                 new_record = new_by_sample.get(sample_key)
-                if new_record is not None and record.get("geometry_hash") is not None:
-                    geometry_same &= str(record.get("geometry_hash")) == str(new_record.get("geometry_hash"))
+                if new_record is None:
+                    geometry_same = False
+                elif record.get("geometry_hash") is not None:
+                    geometry_same &= str(record.get("geometry_hash")) == str(
+                        new_record.get("geometry_hash")
+                    )
                 rows.append(
                     {
                         "dataset_id": dataset_id,

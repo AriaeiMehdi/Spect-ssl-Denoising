@@ -113,6 +113,24 @@ class MigrationTests(unittest.TestCase):
             # legacy exposure scaling, so the exact-artifact report must reject
             # transfer even though every hash is present.
             self.assertFalse(report["legacy_backbone_compatibility"])
+            missing_sample_report = build_exposure_migration_report(
+                (("dataset1", root, manifest),),
+                config=ReaderConfig(hash_key=b"test-secret"),
+                old_normalization=old_norm,
+                new_normalization=new_norm,
+                new_manifests={"dataset1": []},
+                old_splits=split_payload,
+                new_splits=split_payload,
+                legacy_checkpoint=checkpoint,
+                old_dataset1_manifest=old_d1,
+                new_dataset1_manifest=new_d1,
+                old_dataset2_manifest=old_d2,
+                new_dataset2_manifest=new_d2,
+                old_splits_path=old_splits,
+                new_splits_path=new_splits,
+            )
+            self.assertFalse(missing_sample_report["geometry_inputs_unchanged"])
+            self.assertFalse(missing_sample_report["legacy_backbone_compatibility"])
 
 
 if __name__ == "__main__":

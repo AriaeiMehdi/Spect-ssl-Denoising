@@ -180,7 +180,7 @@ class ConsistencyTests(unittest.TestCase):
         from gated_spect.losses import covariance_offdiagonal_loss
 
         current = torch.randn(2, 8, requires_grad=True)
-        history = torch.randn(510, 8)
+        history = torch.randn(510, 8, requires_grad=True)
         loss, ready = covariance_offdiagonal_loss(
             current, history, minimum_samples=512, return_ready=True
         )
@@ -204,6 +204,22 @@ class ConsistencyTests(unittest.TestCase):
         scaled_large = covariance_offdiagonal_loss(100.0 * values, minimum_samples=512)
         self.assertAlmostEqual(float(baseline), float(scaled_small), delta=1.0e-4)
         self.assertAlmostEqual(float(baseline), float(scaled_large), delta=1.0e-4)
+
+    def test_global_head_executes_with_covariance_weight_enabled(self) -> None:
+        head = GlobalConsistencyHead(
+            dimension=4,
+            queue_capacity=16,
+            covariance_loss_weight=0.01,
+            covariance_min_samples=2,
+        )
+        representation_a = torch.randn(3, 4, requires_grad=True)
+        representation_b = torch.randn(3, 4, requires_grad=True)
+        result = head(representation_a, representation_b)
+        self.assertTrue(bool(result.covariance_ready))
+        self.assertTrue(torch.isfinite(result.total))
+        result.total.backward()
+        self.assertIsNotNone(representation_a.grad)
+        self.assertIsNotNone(representation_b.grad)
 
     def test_queue_and_variance_warmup(self) -> None:
         queue = RepresentationQueue(dimension=4, capacity=5)

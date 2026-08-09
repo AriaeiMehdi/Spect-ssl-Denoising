@@ -35,6 +35,23 @@ def _mean(values: Iterable[float]) -> float:
     return float(sum(values) / len(values)) if values else float("nan")
 
 
+def _average_mapping(values: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Average numeric leaves while preserving arbitrarily nested metrics."""
+
+    values = list(values)
+    keys = set().union(*(value.keys() for value in values))
+    averaged: dict[str, Any] = {}
+    for key in sorted(keys):
+        entries = [value[key] for value in values if key in value]
+        if not entries:
+            continue
+        if all(isinstance(entry, Mapping) for entry in entries):
+            averaged[key] = _average_mapping(entries)
+        else:
+            averaged[key] = _mean(float(entry) for entry in entries)
+    return averaged
+
+
 def select_best_epoch(rows: list[Mapping[str, Any]]) -> int:
     """Select the minimum mean validation deviance, with bias as tie-breaker."""
 
@@ -218,8 +235,24 @@ def _pseudocount_summary(runs: list[dict[str, Any]], resamples: int) -> dict[str
                 patient_groups[patient].append(values)
         patient_values: dict[str, dict[str, Any]] = {
             patient: {
-                key: _mean(item[key] for item in values)
-                for key in ("model_deviance", "naive_deviance", "absolute_bias")
+                "model_deviance": _mean(item["model_deviance"] for item in values),
+                "naive_deviance": _mean(item["naive_deviance"] for item in values),
+                "absolute_bias": _mean(item["absolute_bias"] for item in values),
+                "per_view_bias": _average_mapping(
+                    item.get("per_view_bias", {}) for item in values
+                ),
+                "zero_input_bin_metrics": _average_mapping(
+                    item.get("zero_input_bin_metrics", {}) for item in values
+                ),
+                "projection_low_signal_mask": _average_mapping(
+                    item.get("projection_low_signal_mask", {}) for item in values
+                ),
+                "low_count_strata": _average_mapping(
+                    item.get("low_count_strata", {}) for item in values
+                ),
+                "calibration_table": _average_mapping(
+                    item.get("calibration_table", {}) for item in values
+                ),
             }
             for patient, values in patient_groups.items()
         }

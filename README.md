@@ -12,7 +12,10 @@ standardized-exposure comparison (mean |delta z| about 3.45e-15; p99 about
 1.07e-14; patient split assignments unchanged), but it predates the exact-file
 hash schema and is intentionally rejected for transfer. Generate a new
 schema-2 report with the exact legacy checkpoint, old/new manifests, splits,
-and normalizations before using `--legacy-backbone-transfer`. Its old
+and normalizations before using `--legacy-backbone-transfer`. The current
+non-overwriting schema-2 report is
+`artifacts\\v2\\qc\\exposure_migration_report_schema2.json`; it also binds the
+active Dataset2 pair manifest. Its old
 absolute-rate decoder is not physically calibrated counts per second.
 Version-1 caches, normalizations, and checkpoints are rejected unless an
 explicit, passing exact-artifact migration gate is supplied.
@@ -112,7 +115,7 @@ baseline-residual decoder learns a bounded multiplicative correction around the
 exposure-scaled 10-second input, which preserves count scale while learning the
 30-second structure:
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\manifests\denoising_pairs.jsonl --splits artifacts\v2\manifests\locked_splits.json --normalization artifacts\v2\manifests\normalization.json --pretrained-checkpoint artifacts\runs\pretrain_best.pt --legacy-backbone-transfer --exposure-migration-report artifacts\v2\qc\exposure_migration_report.json --checkpoint artifacts\v2\runs\denoise_residual_best40.pt --metrics-output artifacts\v2\runs\denoise_residual_best40_metrics.jsonl --log-output artifacts\v2\runs\denoise_residual_best40_events.jsonl --epochs 40 --freeze-epochs 8 --batch-size 1 --accumulation-steps 8 --num-workers 1 --frame-chunk-size 128 --baseline-pseudocount 0.5
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\manifests\denoising_pairs.jsonl --splits artifacts\v2\manifests\locked_splits.json --normalization artifacts\v2\manifests\normalization.json --pretrained-checkpoint artifacts\runs\pretrain_best.pt --legacy-backbone-transfer --exposure-migration-report artifacts\v2\qc\exposure_migration_report_schema2.json --checkpoint artifacts\v2\runs\denoise_residual_best40.pt --metrics-output artifacts\v2\runs\denoise_residual_best40_metrics.jsonl --log-output artifacts\v2\runs\denoise_residual_best40_events.jsonl --epochs 40 --freeze-epochs 8 --batch-size 1 --accumulation-steps 8 --num-workers 1 --frame-chunk-size 128 --baseline-pseudocount 0.5
 
 The denoiser command initializes only the backbone from the pretrained
 checkpoint, creates a fresh rate decoder, freezes the frame encoder/first
@@ -150,7 +153,7 @@ Save a detector-slice comparison for one accepted Dataset 2 pair. The
 visualizer checks the checkpoint's recorded decoder mode and refuses to load a
 residual checkpoint with the non-residual interpretation (or vice versa):
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect visualize-denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\manifests\denoising_pairs.jsonl --normalization artifacts\v2\manifests\normalization.json --pretrained-checkpoint artifacts\runs\pretrain_best.pt --legacy-backbone-transfer --exposure-migration-report artifacts\v2\qc\exposure_migration_report.json --checkpoint artifacts\v2\runs\denoise_residual_best40.pt --output artifacts\v2\visualizations\denoise_residual_pair0.png --pair-index 0 --gate-index 0 --view-index 0 --frame-chunk-size 128
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect visualize-denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\manifests\denoising_pairs.jsonl --normalization artifacts\v2\manifests\normalization.json --pretrained-checkpoint artifacts\runs\pretrain_best.pt --legacy-backbone-transfer --exposure-migration-report artifacts\v2\qc\exposure_migration_report_schema2.json --checkpoint artifacts\v2\runs\denoise_residual_best40.pt --output artifacts\v2\visualizations\denoise_residual_pair0.png --pair-index 0 --gate-index 0 --view-index 0 --frame-chunk-size 128
 
 The saved PNG contains three panels: the 10-second low-count input, the
 denoiser prediction converted to expected counts at the high acquisition's
