@@ -62,6 +62,8 @@ def main() -> int:
                 str(run_root / "metrics.jsonl"),
                 "--log-output",
                 str(run_root / "events.jsonl"),
+                "--patient-metrics-output",
+                str(run_root / "patient_metrics.jsonl"),
                 "--epochs",
                 str(args.epochs),
                 "--batch-size",

@@ -116,6 +116,18 @@ The pseudocount is a versioned hyperparameter, not a physical constant; run
 matched validation retraining for the planned ablation values 0.5, 0.1, 0.01,
 and 0.001 before selecting it.
 
+The reproducible launchers are `scripts/run_pseudocount_ablation.py` and
+`scripts/run_matched_denoising.py`. Pass `--patient-metrics-output` (included
+by both launchers) to retain validation rows with patient IDs, then create a
+patient-bootstrap report without touching the locked test cohort:
+
+    D:\global environment\torch_cuda124\Scripts\python.exe scripts\analyze_denoising_runs.py --mode matched --run pretrained_606=artifacts\v2\runs\matched\pretrained_alpha_0.5_seed_20260806\patient_metrics.jsonl --run pretrained_607=artifacts\v2\runs\matched\pretrained_alpha_0.5_seed_20260807\patient_metrics.jsonl --run pretrained_608=artifacts\v2\runs\matched\pretrained_alpha_0.5_seed_20260808\patient_metrics.jsonl --run scratch_606=artifacts\v2\runs\matched\scratch_alpha_0.5_seed_20260806\patient_metrics.jsonl --run scratch_607=artifacts\v2\runs\matched\scratch_alpha_0.5_seed_20260807\patient_metrics.jsonl --run scratch_608=artifacts\v2\runs\matched\scratch_alpha_0.5_seed_20260808\patient_metrics.jsonl --output artifacts\v2\qc\matched_report.json
+
+Matched mode requires at least three common seeds. The report selects epochs
+from validation only, averages duplicate pair rows within patient, and marks
+the SSL improvement criterion as supported only when the patient-bootstrap
+95% CI for pretrained-minus-scratch deviance is below zero.
+
 Save a detector-slice comparison for one accepted Dataset 2 pair. The
 visualizer checks the checkpoint's recorded decoder mode and refuses to load a
 residual checkpoint with the non-residual interpretation (or vice versa):

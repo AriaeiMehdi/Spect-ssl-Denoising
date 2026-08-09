@@ -9,6 +9,7 @@ from gated_spect.versioning import IncompatibleArtifactError
 from gated_spect.models import ProjectionDenoiser
 from gated_spect.training import (
     denoising_step,
+    evaluate_denoising_patients,
     evaluate_epoch,
     load_checkpoint,
     parameter_summary,
@@ -47,6 +48,39 @@ def _batch() -> dict[str, torch.Tensor]:
 
 
 class TrainingStepTests(unittest.TestCase):
+    def test_patient_evaluation_retains_identity_and_naive_baseline(self) -> None:
+        from types import SimpleNamespace
+
+        class IdentityRateModel(torch.nn.Module):
+            baseline_residual = False
+
+            def forward(self, **batch):
+                return SimpleNamespace(rate=batch["counts_input"].squeeze(3))
+
+        batch = {
+            "counts_input": torch.tensor([[[[[[1.0, 2.0]]]]]]),
+            "input_exposure_s": torch.tensor([[[2.0]]]),
+            "target_counts": torch.tensor([[[[[3, 6]]]]]),
+            "target_exposure_s": torch.tensor([[[3.0]]]),
+            "target_weight": torch.ones(1, 1, 1),
+            "counts_raw": torch.tensor([[[[[2, 4]]]]]),
+            "meta": [{"patient_key": "p1", "pair_id": "pair1"}],
+            "visibility": torch.ones(1, 1, 1, 1, 2, dtype=torch.bool),
+            "valid_frames": torch.ones(1, 1, 1, dtype=torch.bool),
+            "angles_rad": torch.zeros(1, 1),
+            "radii_mm": torch.ones(1, 1),
+            "gate_phase_rad": torch.zeros(1, 1),
+            "split_fraction": torch.zeros(1, 1),
+            "scanner_index": torch.zeros(1, dtype=torch.long),
+            "collimator_index": torch.zeros(1, dtype=torch.long),
+            "stress_rest_index": torch.zeros(1, dtype=torch.long),
+        }
+        rows = evaluate_denoising_patients(IdentityRateModel(), [batch], device="cpu")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["patient_key"], "p1")
+        self.assertAlmostEqual(rows[0]["model_deviance"], 0.0, places=6)
+        self.assertAlmostEqual(rows[0]["naive_deviance"], 0.0, places=6)
+
     def test_amp_scale_drop_marks_optimizer_step_skipped(self) -> None:
         class FakeScaler:
             def __init__(self) -> None:

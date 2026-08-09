@@ -19,6 +19,8 @@ from .consistency_steps import (
     two_view_pretraining_step,
 )
 from .steps import DenoisingLoss, PretrainingLoss, denoising_step, pretraining_step
+from ..data.torch_dataset import model_batch
+from ..losses import poisson_deviance
 from ..versioning import artifact_version_metadata, require_artifact_versions
 
 
@@ -288,6 +290,86 @@ def train_epoch(
         },
     )
     return metrics
+
+
+@torch.no_grad()
+def evaluate_denoising_patients(
+    model: nn.Module,
+    loader: Iterable[Mapping[str, Any]],
+    *,
+    device: torch.device | str,
+    max_batches: int | None = None,
+    amp: bool = False,
+) -> list[dict[str, Any]]:
+    """Return validation deviance/bias rows retaining patient identity.
+
+    Epoch reducers intentionally average within a batch and discard identity.
+    This helper uses the same selected-bin weighting but emits pair-level rows
+    so downstream reports can average by patient and bootstrap patients.  The
+    caller must provide a validation-only loader; this function never touches
+    a locked test split.
+    """
+
+    device = torch.device(device)
+    model.eval()
+    rows: list[dict[str, Any]] = []
+    for batch_index, batch in enumerate(loader):
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        moved = _move_batch(batch, device, non_blocking=device.type == "cuda")
+        autocast_enabled = bool(amp and device.type == "cuda")
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=autocast_enabled,
+        ):
+            output = model(
+                **model_batch(
+                    moved,
+                    include_counts_raw=bool(getattr(model, "baseline_residual", False)),
+                )
+            )
+        rate = output.rate.float()
+        target_counts = moved["target_counts"].float()
+        target_exposure = moved["target_exposure_s"].float()
+        target_weight = moved["target_weight"].float()
+        input_exposure = moved["input_exposure_s"].float()
+        counts_raw = moved["counts_raw"].float()
+        mean = target_exposure[..., None, None] * rate
+        weights = target_weight[..., None, None].expand_as(mean)
+        naive_rate = counts_raw / input_exposure[..., None, None].clamp_min(1.0e-8)
+        naive_mean = target_exposure[..., None, None] * naive_rate
+        model_values = poisson_deviance(mean, target_counts, reduction="none")
+        naive_values = poisson_deviance(naive_mean, target_counts, reduction="none")
+        denominator = weights.flatten(1).sum(dim=1).clamp_min(1.0)
+        model_deviance = (model_values * weights).flatten(1).sum(dim=1) / denominator
+        naive_deviance = (naive_values * weights).flatten(1).sum(dim=1) / denominator
+        predicted_total = (mean * weights).flatten(1).sum(dim=1)
+        naive_total = (naive_mean * weights).flatten(1).sum(dim=1)
+        target_total = (target_counts * weights).flatten(1).sum(dim=1)
+        model_bias = (predicted_total - target_total) / target_total.clamp_min(1.0)
+        naive_bias = (naive_total - target_total) / target_total.clamp_min(1.0)
+        metadata = batch.get("meta", [])
+        for row_index in range(rate.shape[0]):
+            item_meta = metadata[row_index] if row_index < len(metadata) else {}
+            if not isinstance(item_meta, Mapping):
+                item_meta = {}
+            rows.append(
+                {
+                    "batch": batch_index,
+                    "patient_key": str(item_meta.get("patient_key", "")),
+                    "pair_id": str(item_meta.get("pair_id", "")),
+                    "model_deviance": float(model_deviance[row_index].cpu()),
+                    "naive_deviance": float(naive_deviance[row_index].cpu()),
+                    "model_total_count_bias_fraction": float(model_bias[row_index].cpu()),
+                    "naive_total_count_bias_fraction": float(naive_bias[row_index].cpu()),
+                    "target_total_counts": float(target_total[row_index].cpu()),
+                    "selected_bins": float(denominator[row_index].cpu()),
+                }
+            )
+    if not rows:
+        raise ValueError("patient evaluation produced no rows")
+    return rows
 
 
 @torch.no_grad()

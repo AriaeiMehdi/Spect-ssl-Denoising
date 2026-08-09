@@ -8,6 +8,7 @@ from .steps import (
 )
 from .runner import (
     EpochMetrics,
+    evaluate_denoising_patients,
     evaluate_epoch,
     evaluate_two_view_epoch,
     load_checkpoint,
@@ -29,6 +30,7 @@ __all__ = [
     "denoising_step",
     "pretraining_step",
     "EpochMetrics",
+    "evaluate_denoising_patients",
     "evaluate_epoch",
     "evaluate_two_view_epoch",
     "load_checkpoint",

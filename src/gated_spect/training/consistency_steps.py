@@ -76,7 +76,12 @@ def _representation_health(projected: Tensor, queue: Any) -> dict[str, Tensor]:
         "representation_participation_rank": participation_rank,
         "representation_effective_rank_fraction": rank_fraction,
         "mean_absolute_offdiagonal_correlation": absolute_off_diagonal.mean(),
-        "p95_absolute_offdiagonal_correlation": torch.quantile(absolute_off_diagonal, 0.95),
+        # Quantile does not support half/bfloat16 on all CUDA versions.  The
+        # diagnostic is intentionally non-training state, so promote it to
+        # float32 before the reduction while retaining the model's device.
+        "p95_absolute_offdiagonal_correlation": torch.quantile(
+            absolute_off_diagonal.float(), 0.95
+        ),
         "max_absolute_offdiagonal_correlation": absolute_off_diagonal.amax(),
         "minimum_component_std": component_std.amin(),
         "median_component_std": component_std.median(),

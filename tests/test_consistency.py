@@ -60,6 +60,14 @@ class ConsistencyTests(unittest.TestCase):
         health = _representation_health(independent, RepresentationQueue(dimension=256))
         self.assertGreater(float(health["representation_effective_rank_fraction"]), 0.5)
 
+    def test_correlation_quantile_promotes_half_precision(self) -> None:
+        # CUDA autocast can hand diagnostics half-precision projected values;
+        # the old implementation passed that dtype to torch.quantile and
+        # crashed.  The corrected diagnostic remains finite.
+        values = torch.randn(32, 16, dtype=torch.float16)
+        health = _representation_health(values, RepresentationQueue(dimension=16))
+        self.assertTrue(torch.isfinite(health["p95_absolute_offdiagonal_correlation"]))
+
     def test_covariance_loss_distinguishes_correlated_features(self) -> None:
         from gated_spect.losses import covariance_offdiagonal_loss
 

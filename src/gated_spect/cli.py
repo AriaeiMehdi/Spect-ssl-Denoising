@@ -238,6 +238,14 @@ def _build_parser() -> argparse.ArgumentParser:
     denoise_parser.add_argument("--normalization", required=True)
     denoise_parser.add_argument("--pretrained-checkpoint", required=True)
     denoise_parser.add_argument(
+        "--scratch",
+        action="store_true",
+        help=(
+            "initialize the same architecture randomly while retaining the "
+            "pretrained checkpoint metadata vocabularies"
+        ),
+    )
+    denoise_parser.add_argument(
         "--legacy-backbone-transfer",
         action="store_true",
         help="allow a version-1 backbone only when a compatible migration report is supplied",
@@ -246,6 +254,10 @@ def _build_parser() -> argparse.ArgumentParser:
     denoise_parser.add_argument("--checkpoint", required=True)
     denoise_parser.add_argument("--metrics-output")
     denoise_parser.add_argument("--log-output")
+    denoise_parser.add_argument(
+        "--patient-metrics-output",
+        help="append validation pair metrics for patient-level experiment analysis",
+    )
     denoise_parser.add_argument("--log-interval", type=int, default=10)
     denoise_parser.add_argument("--epochs", type=int, default=80)
     denoise_parser.add_argument("--freeze-epochs", type=int, default=8)
@@ -1091,6 +1103,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         from .models import ProjectionBackbone, ProjectionDenoiser
         from .training import (
+            evaluate_denoising_patients,
             evaluate_epoch,
             parameter_summary,
             save_checkpoint,
@@ -1201,6 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
             persistent_workers=args.num_workers > 0,
             **({"prefetch_factor": 2} if args.num_workers > 0 else {}),
             collate_fn=collate_acquisitions,
+            generator=torch.Generator().manual_seed(args.seed + 1009),
         )
         validation_loader = DataLoader(
             validation_data,
@@ -1267,7 +1281,9 @@ def main(argv: list[str] | None = None) -> int:
             baseline_residual=args.baseline_residual,
             baseline_pseudocount=args.baseline_pseudocount,
         )
-        model.backbone.load_state_dict(backbone_state, strict=True)
+        initialization = "scratch" if args.scratch else "pretrained"
+        if not args.scratch:
+            model.backbone.load_state_dict(backbone_state, strict=True)
         model = model.to(device)
 
         def set_trainable_stage(epoch: int) -> None:
@@ -1319,6 +1335,11 @@ def main(argv: list[str] | None = None) -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if log_path.resolve() == metrics_path.resolve():
             raise SystemExit("--log-output and --metrics-output must be different files")
+        patient_metrics_path = (
+            Path(args.patient_metrics_output) if args.patient_metrics_output else None
+        )
+        if patient_metrics_path is not None:
+            patient_metrics_path.parent.mkdir(parents=True, exist_ok=True)
         run_started = time.perf_counter()
 
         def emit_event(event: Mapping[str, Any]) -> None:
@@ -1394,6 +1415,9 @@ def main(argv: list[str] | None = None) -> int:
                 "amp_init_scale": args.amp_init_scale,
                 "baseline_residual": bool(args.baseline_residual),
                 "baseline_pseudocount": args.baseline_pseudocount,
+                "initialization": initialization,
+                "weights_transferred": not args.scratch,
+                "metadata_source_checkpoint": str(Path(args.pretrained_checkpoint).resolve()),
                 "legacy_backbone_transfer": bool(args.legacy_backbone_transfer),
                 "source_checkpoint_scientific_semantics_version": int(
                     pretrained_metadata.get("scientific_semantics_version", 1)
@@ -1409,6 +1433,9 @@ def main(argv: list[str] | None = None) -> int:
                 "checkpoint": str(Path(args.checkpoint).resolve()),
                 "metrics_output": str(metrics_path.resolve()),
                 "log_output": str(log_path.resolve()),
+                "patient_metrics_output": (
+                    str(patient_metrics_path.resolve()) if patient_metrics_path else None
+                ),
             }
         )
 
@@ -1464,6 +1491,32 @@ def main(argv: list[str] | None = None) -> int:
                 epoch=epoch,
                 progress_callback=emit_event,
             )
+            if patient_metrics_path is not None:
+                patient_rows = evaluate_denoising_patients(
+                    model,
+                    validation_loader,
+                    device=device,
+                    max_batches=args.max_batches,
+                    amp=args.amp,
+                )
+                with patient_metrics_path.open(
+                    "a", encoding="utf-8", newline="\n"
+                ) as handle:
+                    for patient_row in patient_rows:
+                        handle.write(
+                            json.dumps(
+                                {
+                                    "epoch": epoch,
+                                    "seed": args.seed,
+                                    "initialization": initialization,
+                                    "baseline_pseudocount": args.baseline_pseudocount,
+                                    **patient_row,
+                                },
+                                sort_keys=True,
+                                allow_nan=False,
+                            )
+                            + "\n"
+                        )
             row = {
                 "epoch": epoch,
                 "stage": stage,
@@ -1519,6 +1572,11 @@ def main(argv: list[str] | None = None) -> int:
                         "amp_init_scale": args.amp_init_scale,
                         "baseline_residual": bool(args.baseline_residual),
                         "baseline_pseudocount": args.baseline_pseudocount,
+                        "initialization": initialization,
+                        "weights_transferred": not args.scratch,
+                        "metadata_source_checkpoint": str(
+                            Path(args.pretrained_checkpoint).resolve()
+                        ),
                         "legacy_backbone_transfer": bool(args.legacy_backbone_transfer),
                         "source_checkpoint_scientific_semantics_version": int(
                             pretrained_metadata.get("scientific_semantics_version", 1)

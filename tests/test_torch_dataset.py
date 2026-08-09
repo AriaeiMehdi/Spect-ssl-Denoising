@@ -77,6 +77,17 @@ class TorchDatasetTests(unittest.TestCase):
         for key in ("counts_raw", "target_counts", "visibility", "split_fraction"):
             self.assertTrue(torch.equal(a[key], b[key]), key)
 
+    def test_validation_epoch_zero_reset_is_deterministic(self) -> None:
+        validation = PretrainingDataset(self.dataset, global_seed=91, epoch=0)
+        first = validation[0]
+        validation.set_epoch(5)
+        changed = validation[0]
+        validation.set_epoch(0)
+        reset = validation[0]
+        self.assertFalse(torch.equal(first["input_counts_raw"], changed["input_counts_raw"]))
+        self.assertTrue(torch.equal(first["input_counts_raw"], reset["input_counts_raw"]))
+        self.assertTrue(torch.equal(first["visibility"], reset["visibility"]))
+
 
 class PairVocabularyTests(unittest.TestCase):
     def test_pair_dataset_uses_pretrained_vocabularies_and_unknown_zero(self) -> None:
