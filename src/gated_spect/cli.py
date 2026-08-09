@@ -31,7 +31,11 @@ from .data.pair_manifest import audit_duration_pairs, write_pair_manifest
 from .data.splits import SplitConfig
 from .types import ReaderConfig
 from .versioning import artifact_version_metadata, require_artifact_versions
-from .training.checkpoint_contract import sha256_file, validate_checkpoint_metadata
+from .training.checkpoint_contract import (
+    sha256_file,
+    state_dict_sha256,
+    validate_checkpoint_metadata,
+)
 
 
 def environment_report() -> dict[str, Any]:
@@ -173,10 +177,22 @@ def _build_parser() -> argparse.ArgumentParser:
     migration_parser.add_argument("--dataset2-root", required=True)
     migration_parser.add_argument("--dataset1-manifest", required=True)
     migration_parser.add_argument("--dataset2-manifest", required=True)
-    migration_parser.add_argument("--new-dataset1-manifest")
-    migration_parser.add_argument("--new-dataset2-manifest")
-    migration_parser.add_argument("--old-splits")
-    migration_parser.add_argument("--new-splits")
+    migration_parser.add_argument("--new-dataset1-manifest", required=True)
+    migration_parser.add_argument("--new-dataset2-manifest", required=True)
+    migration_parser.add_argument(
+        "--new-dataset2-pairs",
+        help=(
+            "optional exact Dataset2 pair-manifest bytes; required when the "
+            "report will authorize legacy denoising transfer"
+        ),
+    )
+    migration_parser.add_argument("--old-splits", required=True)
+    migration_parser.add_argument("--new-splits", required=True)
+    migration_parser.add_argument(
+        "--legacy-checkpoint",
+        required=True,
+        help="exact legacy checkpoint bytes evaluated by this migration report",
+    )
     migration_parser.add_argument("--old-normalization", required=True)
     migration_parser.add_argument("--new-normalization", required=True)
     migration_parser.add_argument("--output-json", required=True)
@@ -226,6 +242,12 @@ def _build_parser() -> argparse.ArgumentParser:
     pretrain_parser.add_argument("--two-view", action=argparse.BooleanOptionalAction, default=True)
     pretrain_parser.add_argument("--representation-queue-capacity", type=int, default=2048)
     pretrain_parser.add_argument("--covariance-loss-weight", type=float, default=0.0)
+    pretrain_parser.add_argument(
+        "--covariance-min-samples",
+        type=int,
+        default=512,
+        help="minimum queue-plus-current samples before covariance regularization is active",
+    )
     pretrain_parser.add_argument("--seed", type=int, default=20260806)
     pretrain_parser.add_argument("--hash-key-env", default="SPECT_HASH_KEY")
     pretrain_parser.add_argument("--institution-id", default="unknown")
@@ -261,6 +283,12 @@ def _build_parser() -> argparse.ArgumentParser:
     denoise_parser.add_argument("--log-interval", type=int, default=10)
     denoise_parser.add_argument("--epochs", type=int, default=80)
     denoise_parser.add_argument("--freeze-epochs", type=int, default=8)
+    denoise_parser.add_argument(
+        "--comparison-protocol",
+        choices=("full_finetune", "partial_freeze_transfer"),
+        default=None,
+        help="protocol label recorded in Dataset2 checkpoints; inferred from freeze_epochs when omitted",
+    )
     denoise_parser.add_argument("--batch-size", type=int, default=1)
     denoise_parser.add_argument("--accumulation-steps", type=int, default=8)
     denoise_parser.add_argument("--num-workers", type=int, default=0)
@@ -283,6 +311,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.5,
         help="positive baseline pseudocount alpha used by the residual-rate target",
+    )
+    denoise_parser.add_argument(
+        "--low-signal-threshold",
+        type=float,
+        default=5.0,
+        help="projection-domain target-count threshold for low-signal metrics",
+    )
+    denoise_parser.add_argument(
+        "--calibration-ranges",
+        default="0,1,2,3-5,6-10,11-20,>20",
+        help="comma-separated raw-count calibration bins",
     )
     denoise_parser.add_argument(
         "--amp-init-scale",
@@ -587,19 +626,13 @@ def main(argv: list[str] | None = None) -> int:
         old_dataset1 = read_jsonl(args.dataset1_manifest)
         old_dataset2 = read_jsonl(args.dataset2_manifest)
         new_manifests: dict[str, list[dict[str, Any]]] = {}
-        if args.new_dataset1_manifest:
-            new_manifests["dataset1"] = read_jsonl(args.new_dataset1_manifest)
-            _require_versioned_rows(new_manifests["dataset1"], "new Dataset1 acquisition manifest")
-        if args.new_dataset2_manifest:
-            new_manifests["dataset2"] = read_jsonl(args.new_dataset2_manifest)
-            _require_versioned_rows(new_manifests["dataset2"], "new Dataset2 acquisition manifest")
-        new_splits_payload = (
-            json.loads(Path(args.new_splits).read_text(encoding="utf-8"))
-            if args.new_splits
-            else None
-        )
-        if new_splits_payload is not None:
-            _require_versioned_splits(new_splits_payload)
+        new_manifests["dataset1"] = read_jsonl(args.new_dataset1_manifest)
+        _require_versioned_rows(new_manifests["dataset1"], "new Dataset1 acquisition manifest")
+        new_manifests["dataset2"] = read_jsonl(args.new_dataset2_manifest)
+        _require_versioned_rows(new_manifests["dataset2"], "new Dataset2 acquisition manifest")
+        new_splits_payload = json.loads(Path(args.new_splits).read_text(encoding="utf-8"))
+        _require_versioned_splits(new_splits_payload)
+        old_splits_payload = json.loads(Path(args.old_splits).read_text(encoding="utf-8"))
         report = build_exposure_migration_report(
             (
                 ("dataset1", args.dataset1_root, old_dataset1),
@@ -609,12 +642,16 @@ def main(argv: list[str] | None = None) -> int:
             old_normalization=args.old_normalization,
             new_normalization=args.new_normalization,
             new_manifests=new_manifests,
-            old_splits=(
-                json.loads(Path(args.old_splits).read_text(encoding="utf-8"))
-                if args.old_splits
-                else None
-            ),
+            old_splits=old_splits_payload,
             new_splits=new_splits_payload,
+            legacy_checkpoint=args.legacy_checkpoint,
+            old_dataset1_manifest=args.dataset1_manifest,
+            new_dataset1_manifest=args.new_dataset1_manifest,
+            old_dataset2_manifest=args.dataset2_manifest,
+            new_dataset2_manifest=args.new_dataset2_manifest,
+            new_dataset2_pairs_manifest=args.new_dataset2_pairs,
+            old_splits_path=args.old_splits,
+            new_splits_path=args.new_splits,
         )
         write_exposure_migration_report(report, args.output_json, args.output_csv)
         print(
@@ -667,6 +704,8 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--representation-queue-capacity must be positive")
         if args.covariance_loss_weight < 0:
             raise SystemExit("--covariance-loss-weight cannot be negative")
+        if args.covariance_min_samples < 2:
+            raise SystemExit("--covariance-min-samples must be at least 2")
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
@@ -766,6 +805,7 @@ def main(argv: list[str] | None = None) -> int:
             GlobalConsistencyHead(
                 queue_capacity=args.representation_queue_capacity,
                 covariance_loss_weight=args.covariance_loss_weight,
+                covariance_min_samples=args.covariance_min_samples,
             ).to(device)
             if args.two_view
             else None
@@ -945,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
                 "two_view": bool(args.two_view),
                 "representation_queue_capacity": args.representation_queue_capacity,
                 "covariance_loss_weight": args.covariance_loss_weight,
+                "covariance_min_samples": args.covariance_min_samples,
                 "device": str(device),
                 "gpu": (
                     torch.cuda.get_device_name(device)
@@ -1057,6 +1098,7 @@ def main(argv: list[str] | None = None) -> int:
                         "two_view": bool(args.two_view),
                         "representation_queue_capacity": args.representation_queue_capacity,
                         "covariance_loss_weight": args.covariance_loss_weight,
+                        "covariance_min_samples": args.covariance_min_samples,
                         "accumulation_steps": args.accumulation_steps,
                         "frame_chunk_size": args.frame_chunk_size,
                         "num_workers": args.num_workers,
@@ -1105,6 +1147,7 @@ def main(argv: list[str] | None = None) -> int:
         from .training import (
             evaluate_denoising_patients,
             evaluate_epoch,
+            parse_calibration_ranges,
             parameter_summary,
             save_checkpoint,
             train_epoch,
@@ -1165,6 +1208,12 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("locked Dataset 2 splits produced an empty train or validation set")
         if args.baseline_pseudocount <= 0:
             raise SystemExit("--baseline-pseudocount must be positive")
+        if args.low_signal_threshold < 0:
+            raise SystemExit("--low-signal-threshold must be nonnegative")
+        try:
+            calibration_ranges = parse_calibration_ranges(args.calibration_ranges)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
 
         # Read pretrained metadata before constructing Dataset2 so categorical
         # IDs use exactly the vocabularies learned during Dataset1 pretraining.
@@ -1178,12 +1227,29 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(pretrained_payload.get("metadata", {}), Mapping)
             else {}
         )
-        validate_checkpoint_metadata(
-            pretrained_metadata,
-            normalization_sha256=sha256_file(args.normalization),
-            allow_legacy_backbone_transfer=bool(args.legacy_backbone_transfer),
-            migration_report=args.exposure_migration_report,
+        pretrained_checkpoint_sha256 = sha256_file(args.pretrained_checkpoint)
+        pairs_sha256 = sha256_file(args.pairs)
+        splits_sha256 = sha256_file(args.splits)
+        migration_report_sha256 = (
+            sha256_file(args.exposure_migration_report)
+            if args.exposure_migration_report
+            else None
         )
+        validation_kwargs: dict[str, Any] = {
+            "normalization_sha256": sha256_file(args.normalization),
+            "allow_legacy_backbone_transfer": bool(args.legacy_backbone_transfer),
+            "migration_report": args.exposure_migration_report,
+            "legacy_checkpoint_sha256": pretrained_checkpoint_sha256,
+        }
+        if args.legacy_backbone_transfer:
+            validation_kwargs.update(
+                {
+                    "manifest_sha256": pairs_sha256,
+                    "pairs_sha256": pairs_sha256,
+                    "splits_sha256": splits_sha256,
+                }
+            )
+        validate_checkpoint_metadata(pretrained_metadata, **validation_kwargs)
         scanner_vocab = dict(pretrained_metadata.get("scanner_vocab", {}))
         collimator_vocab = dict(pretrained_metadata.get("collimator_vocab", {}))
         stress_vocab = dict(pretrained_metadata.get("stress_rest_vocab", {}))
@@ -1282,9 +1348,24 @@ def main(argv: list[str] | None = None) -> int:
             baseline_pseudocount=args.baseline_pseudocount,
         )
         initialization = "scratch" if args.scratch else "pretrained"
+        decoder_initialization_sha256 = state_dict_sha256(model.decoder)
+        backbone_initialization_sha256 = state_dict_sha256(model.backbone)
         if not args.scratch:
             model.backbone.load_state_dict(backbone_state, strict=True)
+        backbone_runtime_sha256 = state_dict_sha256(model.backbone)
         model = model.to(device)
+
+        comparison_protocol = args.comparison_protocol or (
+            "full_finetune" if args.freeze_epochs == 0 else "partial_freeze_transfer"
+        )
+        expected_protocol = (
+            "full_finetune" if args.freeze_epochs == 0 else "partial_freeze_transfer"
+        )
+        if comparison_protocol != expected_protocol:
+            raise SystemExit(
+                "--comparison-protocol does not match --freeze-epochs; "
+                f"expected {expected_protocol!r}"
+            )
 
         def set_trainable_stage(epoch: int) -> None:
             if epoch < args.freeze_epochs:
@@ -1402,6 +1483,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "epochs": args.epochs,
                 "freeze_epochs": args.freeze_epochs,
+                "comparison_protocol": comparison_protocol,
                 "batch_size": args.batch_size,
                 "accumulation_steps": args.accumulation_steps,
                 "effective_batch_size": args.batch_size * args.accumulation_steps,
@@ -1417,8 +1499,14 @@ def main(argv: list[str] | None = None) -> int:
                 "baseline_pseudocount": args.baseline_pseudocount,
                 "initialization": initialization,
                 "weights_transferred": not args.scratch,
+                "decoder_initialization_sha256": decoder_initialization_sha256,
+                "backbone_initialization_sha256": backbone_initialization_sha256,
+                "backbone_runtime_sha256": backbone_runtime_sha256,
                 "metadata_source_checkpoint": str(Path(args.pretrained_checkpoint).resolve()),
                 "legacy_backbone_transfer": bool(args.legacy_backbone_transfer),
+                "legacy_checkpoint_sha256": pretrained_checkpoint_sha256,
+                "migration_report_sha256": migration_report_sha256,
+                "migration_schema_version": 2 if args.exposure_migration_report else None,
                 "source_checkpoint_scientific_semantics_version": int(
                     pretrained_metadata.get("scientific_semantics_version", 1)
                 ),
@@ -1498,6 +1586,8 @@ def main(argv: list[str] | None = None) -> int:
                     device=device,
                     max_batches=args.max_batches,
                     amp=args.amp,
+                    low_signal_threshold=args.low_signal_threshold,
+                    calibration_ranges=calibration_ranges,
                 )
                 with patient_metrics_path.open(
                     "a", encoding="utf-8", newline="\n"
@@ -1574,10 +1664,16 @@ def main(argv: list[str] | None = None) -> int:
                         "baseline_pseudocount": args.baseline_pseudocount,
                         "initialization": initialization,
                         "weights_transferred": not args.scratch,
+                        "decoder_initialization_sha256": decoder_initialization_sha256,
+                        "backbone_initialization_sha256": backbone_initialization_sha256,
+                        "backbone_runtime_sha256": backbone_runtime_sha256,
                         "metadata_source_checkpoint": str(
                             Path(args.pretrained_checkpoint).resolve()
                         ),
                         "legacy_backbone_transfer": bool(args.legacy_backbone_transfer),
+                        "legacy_checkpoint_sha256": pretrained_checkpoint_sha256,
+                        "migration_report_sha256": migration_report_sha256,
+                        "migration_schema_version": 2 if args.exposure_migration_report else None,
                         "source_checkpoint_scientific_semantics_version": int(
                             pretrained_metadata.get("scientific_semantics_version", 1)
                         ),
@@ -1589,14 +1685,15 @@ def main(argv: list[str] | None = None) -> int:
                         "batch_size": args.batch_size,
                         "accumulation_steps": args.accumulation_steps,
                         "freeze_epochs": args.freeze_epochs,
+                        "comparison_protocol": comparison_protocol,
                         "frame_chunk_size": frame_chunk_size,
                         "pretrained_checkpoint": str(Path(args.pretrained_checkpoint).resolve()),
                         "pairs": str(Path(args.pairs).resolve()),
                         "splits": str(Path(args.splits).resolve()),
                         "normalization": normalization.to_dict(),
                         "normalization_sha256": sha256_file(args.normalization),
-                        "pairs_sha256": sha256_file(args.pairs),
-                        "splits_sha256": sha256_file(args.splits),
+                        "pairs_sha256": pairs_sha256,
+                        "splits_sha256": splits_sha256,
                     },
                 )
             else:
@@ -1694,12 +1791,21 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(pretrained_payload.get("metadata", {}), Mapping)
             else {}
         )
-        validate_checkpoint_metadata(
-            pretrained_metadata,
-            normalization_sha256=sha256_file(args.normalization),
-            allow_legacy_backbone_transfer=bool(args.legacy_backbone_transfer),
-            migration_report=args.exposure_migration_report,
-        )
+        donor_validation_kwargs: dict[str, Any] = {
+            "normalization_sha256": sha256_file(args.normalization),
+            "allow_legacy_backbone_transfer": bool(args.legacy_backbone_transfer),
+            "migration_report": args.exposure_migration_report,
+            "legacy_checkpoint_sha256": sha256_file(args.pretrained_checkpoint),
+        }
+        if args.legacy_backbone_transfer:
+            donor_validation_kwargs.update(
+                {
+                    "manifest_sha256": sha256_file(args.pairs),
+                    "pairs_sha256": sha256_file(args.pairs),
+                    "splits_sha256": sha256_file(args.splits),
+                }
+            )
+        validate_checkpoint_metadata(pretrained_metadata, **donor_validation_kwargs)
         scanner_vocab = dict(pretrained_metadata.get("scanner_vocab", {}))
         collimator_vocab = dict(pretrained_metadata.get("collimator_vocab", {}))
         stress_vocab = dict(pretrained_metadata.get("stress_rest_vocab", {}))
@@ -1938,12 +2044,21 @@ def main(argv: list[str] | None = None) -> int:
             if isinstance(pretrained_payload.get("metadata", {}), Mapping)
             else {}
         )
-        validate_checkpoint_metadata(
-            pretrained_metadata,
-            normalization_sha256=sha256_file(args.normalization),
-            allow_legacy_backbone_transfer=bool(args.legacy_backbone_transfer),
-            migration_report=args.exposure_migration_report,
-        )
+        donor_validation_kwargs: dict[str, Any] = {
+            "normalization_sha256": sha256_file(args.normalization),
+            "allow_legacy_backbone_transfer": bool(args.legacy_backbone_transfer),
+            "migration_report": args.exposure_migration_report,
+            "legacy_checkpoint_sha256": sha256_file(args.pretrained_checkpoint),
+        }
+        if args.legacy_backbone_transfer:
+            donor_validation_kwargs.update(
+                {
+                    "manifest_sha256": sha256_file(args.pairs),
+                    "pairs_sha256": sha256_file(args.pairs),
+                    "splits_sha256": sha256_file(args.splits),
+                }
+            )
+        validate_checkpoint_metadata(pretrained_metadata, **donor_validation_kwargs)
         scanner_vocab = dict(pretrained_metadata.get("scanner_vocab", {}))
         collimator_vocab = dict(pretrained_metadata.get("collimator_vocab", {}))
         stress_vocab = dict(pretrained_metadata.get("stress_rest_vocab", {}))

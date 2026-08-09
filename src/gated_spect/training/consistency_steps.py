@@ -187,6 +187,7 @@ def two_view_pretraining_step(
         }
         health.update(_representation_health(torch.cat((global_loss.projected_a, global_loss.projected_b), dim=0), consistency_head.queue))
         health["covariance_offdiagonal_loss"] = global_loss.covariance.detach()
+        health["covariance_ready"] = global_loss.covariance_ready.detach()
         clip_values = [
             value
             for value in (

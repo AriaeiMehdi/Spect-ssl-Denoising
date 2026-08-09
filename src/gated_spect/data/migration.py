@@ -8,6 +8,7 @@ the raw DICOM and writes a quantitative compatibility decision.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -18,6 +19,14 @@ import pydicom
 from ..types import ReaderConfig
 from .dicom_reader import _first_value, _nested_value, read_nm_dicom
 from .exposure import estimate_exposure
+
+
+def _sha256_file(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _stats_payload(path: str | Path) -> dict[str, float]:
@@ -74,6 +83,14 @@ def build_exposure_migration_report(
     new_manifests: Mapping[str, Iterable[Mapping[str, Any]]] | None = None,
     old_splits: Mapping[str, Any] | None = None,
     new_splits: Mapping[str, Any] | None = None,
+    legacy_checkpoint: str | Path | None = None,
+    old_dataset1_manifest: str | Path | None = None,
+    new_dataset1_manifest: str | Path | None = None,
+    old_dataset2_manifest: str | Path | None = None,
+    new_dataset2_manifest: str | Path | None = None,
+    new_dataset2_pairs_manifest: str | Path | None = None,
+    old_splits_path: str | Path | None = None,
+    new_splits_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Compare legacy and corrected exposure values for raw-DICOM samples."""
 
@@ -148,12 +165,6 @@ def build_exposure_migration_report(
     )
     mean_abs_delta = float(delta_array.mean()) if delta_array.size else float("inf")
     p99_abs_delta = float(np.percentile(delta_array, 99)) if delta_array.size else float("inf")
-    compatibility = bool(
-        count_norm_equal
-        and geometry_same
-        and mean_abs_delta < 1.0e-3
-        and p99_abs_delta < 1.0e-2
-    )
     split_summary: dict[str, Any] = {
         "provided": old_splits is not None and new_splits is not None,
         "unchanged": None,
@@ -172,7 +183,63 @@ def build_exposure_migration_report(
         split_summary["unchanged"] = changed == 0
         split_summary["changed_assignments"] = changed
         split_summary["compared_assignments"] = compared
+
+    artifact_hashes = {
+        "legacy_checkpoint_sha256": _sha256_file(legacy_checkpoint)
+        if legacy_checkpoint is not None
+        else None,
+        "old_dataset1_manifest_sha256": _sha256_file(old_dataset1_manifest)
+        if old_dataset1_manifest is not None
+        else None,
+        "new_dataset1_manifest_sha256": _sha256_file(new_dataset1_manifest)
+        if new_dataset1_manifest is not None
+        else None,
+        "old_dataset2_manifest_sha256": _sha256_file(old_dataset2_manifest)
+        if old_dataset2_manifest is not None
+        else None,
+        "new_dataset2_manifest_sha256": _sha256_file(new_dataset2_manifest)
+        if new_dataset2_manifest is not None
+        else None,
+        # Dataset2 training consumes the derived pair manifest.  Keep this
+        # optional for compatibility with the normative acquisition-manifest
+        # schema, but include it whenever the migration audit is intended to
+        # authorize a denoising run.
+        "new_dataset2_pairs_sha256": _sha256_file(new_dataset2_pairs_manifest)
+        if new_dataset2_pairs_manifest is not None
+        else None,
+        "old_splits_sha256": _sha256_file(old_splits_path)
+        if old_splits_path is not None
+        else None,
+        "new_splits_sha256": _sha256_file(new_splits_path)
+        if new_splits_path is not None
+        else None,
+        "old_normalization_sha256": _sha256_file(old_normalization),
+        "new_normalization_sha256": _sha256_file(new_normalization),
+    }
+    required_artifact_keys = (
+        "legacy_checkpoint_sha256",
+        "old_dataset1_manifest_sha256",
+        "new_dataset1_manifest_sha256",
+        "old_dataset2_manifest_sha256",
+        "new_dataset2_manifest_sha256",
+        "old_splits_sha256",
+        "new_splits_sha256",
+        "old_normalization_sha256",
+        "new_normalization_sha256",
+    )
+    artifact_hashes_complete = all(
+        artifact_hashes[key] is not None for key in required_artifact_keys
+    )
+    compatibility = bool(
+        count_norm_equal
+        and geometry_same
+        and mean_abs_delta < 1.0e-3
+        and p99_abs_delta < 1.0e-2
+        and artifact_hashes_complete
+        and split_summary["unchanged"] is True
+    )
     return {
+        "migration_schema_version": 2,
         "scientific_semantics_version_old": 1,
         "scientific_semantics_version_new": 2,
         "exposure_semantics_version_old": 1,
@@ -191,6 +258,8 @@ def build_exposure_migration_report(
         "max_abs_delta_z": float(delta_array.max()) if delta_array.size else float("inf"),
         "legacy_rate_decoder_physically_calibrated": False,
         "patient_split_migration": split_summary,
+        "artifact_hashes_complete": artifact_hashes_complete,
+        **artifact_hashes,
         "rows": rows,
     }
 

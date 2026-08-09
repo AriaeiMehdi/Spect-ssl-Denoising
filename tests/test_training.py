@@ -1,4 +1,5 @@
 import math
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +19,7 @@ from gated_spect.training import (
     train_epoch,
     optimizer_step_succeeded,
 )
-from gated_spect.training.checkpoint_contract import validate_checkpoint_metadata
+from gated_spect.training.checkpoint_contract import sha256_file, validate_checkpoint_metadata
 
 
 def _batch() -> dict[str, torch.Tensor]:
@@ -80,6 +81,42 @@ class TrainingStepTests(unittest.TestCase):
         self.assertEqual(rows[0]["patient_key"], "p1")
         self.assertAlmostEqual(rows[0]["model_deviance"], 0.0, places=6)
         self.assertAlmostEqual(rows[0]["naive_deviance"], 0.0, places=6)
+        self.assertIn("per_view_bias", rows[0])
+        self.assertIn("mean_absolute_bias", rows[0]["per_view_bias"])
+        self.assertIn("zero_input_bin_metrics", rows[0])
+        self.assertIn("low_count_strata", rows[0])
+        self.assertIn("projection_low_signal_mask", rows[0])
+        self.assertIn("calibration_table", rows[0])
+
+    def test_expanded_patient_metrics_are_not_aggregated_across_batch(self) -> None:
+        from types import SimpleNamespace
+
+        class IdentityRateModel(torch.nn.Module):
+            baseline_residual = False
+
+            def forward(self, **batch):
+                return SimpleNamespace(rate=batch["counts_input"].squeeze(3))
+
+        first = _batch()
+        second = _batch()
+        first["counts_input"].fill_(1.0)
+        first["target_counts"].fill_(1.0)
+        second["counts_input"].fill_(2.0)
+        second["target_counts"].fill_(4.0)
+        batch = {
+            key: torch.cat([first[key], second[key]], dim=0)
+            for key in first
+            if key != "meta"
+        }
+        batch["meta"] = [
+            {"patient_key": "p1", "pair_id": "pair1"},
+            {"patient_key": "p2", "pair_id": "pair2"},
+        ]
+        rows = evaluate_denoising_patients(IdentityRateModel(), [batch], device="cpu")
+        self.assertEqual(rows[0]["per_view_bias"]["mean_absolute_bias"], 0.0)
+        self.assertAlmostEqual(
+            rows[1]["per_view_bias"]["mean_absolute_bias"], 0.5, places=6
+        )
 
     def test_amp_scale_drop_marks_optimizer_step_skipped(self) -> None:
         class FakeScaler:
@@ -167,14 +204,87 @@ class TrainingStepTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "migration.json"
             report.write_text('{"legacy_backbone_compatibility": true}', encoding="utf-8")
-            validate_checkpoint_metadata(
-                {}, allow_legacy_backbone_transfer=True, migration_report=report
-            )
-            report.write_text('{"legacy_backbone_compatibility": false}', encoding="utf-8")
             with self.assertRaises(IncompatibleArtifactError):
                 validate_checkpoint_metadata(
-                    {}, allow_legacy_backbone_transfer=True, migration_report=report
+                    {},
+                    allow_legacy_backbone_transfer=True,
+                    migration_report=report,
+                    legacy_checkpoint_sha256="unused",
                 )
+
+    def test_legacy_transfer_binds_exact_checkpoint_and_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "legacy.pt"
+            checkpoint.write_bytes(b"legacy-checkpoint")
+            artifact_names = (
+                "old_dataset1.jsonl",
+                "new_dataset1.jsonl",
+                "old_dataset2.jsonl",
+                "new_dataset2.jsonl",
+                "old_splits.json",
+                "new_splits.json",
+                "old_norm.json",
+                "new_norm.json",
+            )
+            artifacts = {}
+            for name in artifact_names:
+                path = root / name
+                path.write_text(name, encoding="utf-8")
+                artifacts[name] = sha256_file(path)
+            report_payload = {
+                "migration_schema_version": 2,
+                "artifact_hashes_complete": True,
+                "legacy_backbone_compatibility": True,
+                "legacy_checkpoint_sha256": sha256_file(checkpoint),
+                "old_dataset1_manifest_sha256": artifacts["old_dataset1.jsonl"],
+                "new_dataset1_manifest_sha256": artifacts["new_dataset1.jsonl"],
+                "old_dataset2_manifest_sha256": artifacts["old_dataset2.jsonl"],
+                "new_dataset2_manifest_sha256": artifacts["new_dataset2.jsonl"],
+                "old_splits_sha256": artifacts["old_splits.json"],
+                "new_splits_sha256": artifacts["new_splits.json"],
+                "old_normalization_sha256": artifacts["old_norm.json"],
+                "new_normalization_sha256": artifacts["new_norm.json"],
+            }
+            report = root / "migration.json"
+            report.write_text(json.dumps(report_payload), encoding="utf-8")
+            kwargs = {
+                "normalization_sha256": artifacts["new_norm.json"],
+                "manifest_sha256": artifacts["new_dataset2.jsonl"],
+                "splits_sha256": artifacts["new_splits.json"],
+                "allow_legacy_backbone_transfer": True,
+                "migration_report": report,
+                "legacy_checkpoint_sha256": sha256_file(checkpoint),
+            }
+            validate_checkpoint_metadata({}, **kwargs)
+            for field, value in (
+                ("legacy_checkpoint_sha256", "wrong-checkpoint"),
+                ("new_normalization_sha256", "wrong-normalization"),
+                ("new_splits_sha256", "wrong-splits"),
+                ("new_dataset2_manifest_sha256", "wrong-manifest"),
+            ):
+                mutated = dict(report_payload)
+                mutated[field] = value
+                report.write_text(json.dumps(mutated), encoding="utf-8")
+                with self.assertRaises(IncompatibleArtifactError):
+                    validate_checkpoint_metadata({}, **kwargs)
+            pair_manifest = root / "new_pairs.jsonl"
+            pair_manifest.write_text("pair-manifest", encoding="utf-8")
+            report_payload["new_dataset2_pairs_sha256"] = sha256_file(pair_manifest)
+            report.write_text(json.dumps(report_payload), encoding="utf-8")
+            pair_kwargs = dict(kwargs)
+            pair_kwargs.update(
+                {
+                    "manifest_sha256": sha256_file(pair_manifest),
+                    "pairs_sha256": sha256_file(pair_manifest),
+                }
+            )
+            validate_checkpoint_metadata({}, **pair_kwargs)
+            report_payload["new_dataset2_pairs_sha256"] = "wrong-pairs"
+            report.write_text(json.dumps(report_payload), encoding="utf-8")
+            with self.assertRaises(IncompatibleArtifactError):
+                validate_checkpoint_metadata({}, **pair_kwargs)
+            report.write_text(json.dumps(report_payload), encoding="utf-8")
 
     def test_gradient_accumulation_steps_optimizer_once_for_two_batches(self) -> None:
         torch.manual_seed(33)

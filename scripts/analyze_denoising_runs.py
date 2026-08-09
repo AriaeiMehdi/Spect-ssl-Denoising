@@ -52,14 +52,24 @@ def select_best_epoch(rows: list[Mapping[str, Any]]) -> int:
     return int(min(ranked)[2])
 
 
-def patient_means(rows: list[Mapping[str, Any]], epoch: int) -> dict[str, dict[str, float]]:
+def patient_means(rows: list[Mapping[str, Any]], epoch: int) -> dict[str, dict[str, Any]]:
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
         if int(row["epoch"]) == epoch:
             grouped[str(row["patient_key"])].append(row)
     if not grouped:
         raise ValueError(f"selected epoch {epoch} has no rows")
-    result: dict[str, dict[str, float]] = {}
+    result: dict[str, dict[str, Any]] = {}
+
+    def average_nested(values: list[Mapping[str, Any]], key: str) -> dict[str, float]:
+        keys = set().union(*(value.get(key, {}).keys() for value in values))
+        return {
+            nested_key: _mean(
+                float(value.get(key, {}).get(nested_key, 0.0)) for value in values
+            )
+            for nested_key in sorted(keys)
+        }
+
     for patient, values in grouped.items():
         result[patient] = {
             "model_deviance": _mean(float(row["model_deviance"]) for row in values),
@@ -68,7 +78,34 @@ def patient_means(rows: list[Mapping[str, Any]], epoch: int) -> dict[str, dict[s
                 abs(float(row.get("model_total_count_bias_fraction", 0.0)))
                 for row in values
             ),
+            "per_view_bias": average_nested(values, "per_view_bias"),
+            "zero_input_bin_metrics": average_nested(values, "zero_input_bin_metrics"),
+            "projection_low_signal_mask": average_nested(
+                values, "projection_low_signal_mask"
+            ),
         }
+        strata: dict[str, dict[str, float]] = {}
+        for row in values:
+            for label, metrics in row.get("low_count_strata", {}).items():
+                strata.setdefault(label, {})
+                for key, metric in metrics.items():
+                    strata[label].setdefault(key, 0.0)
+                    strata[label][key] += float(metric)
+        for label, metrics in strata.items():
+            for key in metrics:
+                metrics[key] /= max(len(values), 1)
+        result[patient]["low_count_strata"] = strata
+        calibration: dict[str, dict[str, float]] = {}
+        for row in values:
+            for label, metrics in row.get("calibration_table", {}).items():
+                calibration.setdefault(label, {})
+                for key, metric in metrics.items():
+                    calibration[label].setdefault(key, 0.0)
+                    calibration[label][key] += float(metric)
+        for label, metrics in calibration.items():
+            for key in metrics:
+                metrics[key] /= max(len(values), 1)
+        result[patient]["calibration_table"] = calibration
     return result
 
 
@@ -175,11 +212,11 @@ def _pseudocount_summary(runs: list[dict[str, Any]], resamples: int) -> dict[str
         groups[run["pseudocount"]].append(run)
     summaries = []
     for alpha, alpha_runs in sorted(groups.items()):
-        patient_groups: dict[str, list[dict[str, float]]] = defaultdict(list)
+        patient_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for run in alpha_runs:
             for patient, values in run["patients"].items():
                 patient_groups[patient].append(values)
-        patient_values = {
+        patient_values: dict[str, dict[str, Any]] = {
             patient: {
                 key: _mean(item[key] for item in values)
                 for key in ("model_deviance", "naive_deviance", "absolute_bias")
@@ -215,10 +252,44 @@ def _pseudocount_summary(runs: list[dict[str, Any]], resamples: int) -> dict[str
                 "mean_absolute_count_bias_fraction": _mean(
                     item["absolute_bias"] for item in patient_values.values()
                 ),
+                "mean_absolute_per_view_bias": _mean(
+                    item["per_view_bias"].get("mean_absolute_bias", 0.0)
+                    for item in patient_values.values()
+                ),
+                "mean_zero_input_bin_bias": _mean(
+                    item["zero_input_bin_metrics"].get("bias", 0.0)
+                    for item in patient_values.values()
+                ),
+                "mean_projection_low_signal_bias": _mean(
+                    item["projection_low_signal_mask"].get("bias", 0.0)
+                    for item in patient_values.values()
+                ),
                 "runs": [{k: v for k, v in run.items() if k not in {"rows", "patients"}} for run in alpha_runs],
             }
         )
-    return {"mode": "pseudocount_ablation", "results": summaries}
+    best_deviance = min((row["mean_model_deviance"] for row in summaries), default=float("inf"))
+    candidates = [
+        row["pseudocount"]
+        for row in summaries
+        if row["mean_model_deviance"] <= best_deviance * 1.01
+        and abs(row["mean_absolute_count_bias_fraction"]) <= 0.03
+    ]
+    return {
+        "mode": "pseudocount_ablation",
+        "selection_rule": {
+            "deviance_within_fraction": 0.01,
+            "absolute_total_count_bias_max": 0.03,
+            "tie_breakers": [
+                "zero_input_bin_bias",
+                "projection_low_signal_bias",
+                "mean_absolute_per_view_bias",
+                "smaller_pseudocount",
+            ],
+            "selection_performed": False,
+        },
+        "qualifying_candidates": candidates,
+        "results": summaries,
+    }
 
 
 def main() -> int:

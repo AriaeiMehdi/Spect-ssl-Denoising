@@ -293,6 +293,87 @@ def train_epoch(
 
 
 @torch.no_grad()
+def _masked_projection_summary(
+    prediction: Tensor,
+    target: Tensor,
+    deviance: Tensor,
+    mask: Tensor,
+    selected: Tensor,
+) -> dict[str, float]:
+    """Summarize detector bins without treating them as independent patients."""
+
+    active = mask & selected
+    count = int(active.sum().item())
+    selected_count = int(selected.sum().item())
+    if count == 0:
+        return {
+            "mean_prediction": 0.0,
+            "mean_target": 0.0,
+            "bias": 0.0,
+            "mae": 0.0,
+            "deviance": 0.0,
+            "cv": 0.0,
+            "bin_count": 0.0,
+            "coverage_fraction": 0.0,
+        }
+    predicted = prediction[active].float()
+    observed = target[active].float()
+    mean_prediction = float(predicted.mean().cpu())
+    mean_target = float(observed.mean().cpu())
+    return {
+        "mean_prediction": mean_prediction,
+        "mean_target": mean_target,
+        "bias": (mean_prediction - mean_target) / max(abs(mean_target), 1.0e-8),
+        "mae": float((predicted - observed).abs().mean().cpu()),
+        "deviance": float(deviance[active].float().mean().cpu()),
+        "cv": float((predicted.std(unbiased=False) / max(abs(mean_prediction), 1.0e-8)).cpu()),
+        "bin_count": float(count),
+        "coverage_fraction": float(count / max(selected_count, 1)),
+    }
+
+
+def default_calibration_ranges() -> tuple[tuple[str, float, float | None], ...]:
+    return (
+        ("0", 0.0, 0.0),
+        ("1", 1.0, 1.0),
+        ("2", 2.0, 2.0),
+        ("3-5", 3.0, 5.0),
+        ("6-10", 6.0, 10.0),
+        ("11-20", 11.0, 20.0),
+        (">20", 20.0, None),
+    )
+
+
+def parse_calibration_ranges(spec: str) -> tuple[tuple[str, float, float | None], ...]:
+    """Parse labels such as ``0,1,2,3-5,6-10,11-20,>20``."""
+
+    ranges: list[tuple[str, float, float | None]] = []
+    for raw in (item.strip() for item in spec.split(",")):
+        if not raw:
+            continue
+        if raw.startswith(">"):
+            low = float(raw[1:])
+            ranges.append((raw, low, None))
+        elif "-" in raw:
+            left, right = raw.split("-", 1)
+            ranges.append((raw, float(left), float(right)))
+        else:
+            value = float(raw)
+            ranges.append((raw, value, value))
+    if not ranges:
+        raise ValueError("calibration range specification is empty")
+    return tuple(ranges)
+
+
+def _range_mask(
+    values: Tensor, low: float, high: float | None, *, exclusive_low: bool = False
+) -> Tensor:
+    if high is None:
+        return values > low if exclusive_low else values >= low
+    return (values >= low) & (values <= high)
+
+
+@torch.no_grad()
 def evaluate_denoising_patients(
     model: nn.Module,
     loader: Iterable[Mapping[str, Any]],
@@ -300,6 +381,8 @@ def evaluate_denoising_patients(
     device: torch.device | str,
     max_batches: int | None = None,
     amp: bool = False,
+    low_signal_threshold: float = 5.0,
+    calibration_ranges: tuple[tuple[str, float, float | None], ...] | None = None,
 ) -> list[dict[str, Any]]:
     """Return validation deviance/bias rows retaining patient identity.
 
@@ -312,6 +395,9 @@ def evaluate_denoising_patients(
 
     device = torch.device(device)
     model.eval()
+    if low_signal_threshold < 0:
+        raise ValueError("low_signal_threshold must be nonnegative")
+    calibration_ranges = calibration_ranges or default_calibration_ranges()
     rows: list[dict[str, Any]] = []
     for batch_index, batch in enumerate(loader):
         if max_batches is not None and batch_index >= max_batches:
@@ -334,13 +420,17 @@ def evaluate_denoising_patients(
         target_exposure = moved["target_exposure_s"].float()
         target_weight = moved["target_weight"].float()
         input_exposure = moved["input_exposure_s"].float()
-        counts_raw = moved["counts_raw"].float()
+        counts_raw = moved.get("counts_raw")
+        if counts_raw is None:
+            counts_raw = moved["counts_input"].squeeze(3) * input_exposure[..., None, None]
+        counts_raw = counts_raw.float()
         mean = target_exposure[..., None, None] * rate
         weights = target_weight[..., None, None].expand_as(mean)
         naive_rate = counts_raw / input_exposure[..., None, None].clamp_min(1.0e-8)
         naive_mean = target_exposure[..., None, None] * naive_rate
         model_values = poisson_deviance(mean, target_counts, reduction="none")
         naive_values = poisson_deviance(naive_mean, target_counts, reduction="none")
+        selected = weights > 0
         denominator = weights.flatten(1).sum(dim=1).clamp_min(1.0)
         model_deviance = (model_values * weights).flatten(1).sum(dim=1) / denominator
         naive_deviance = (naive_values * weights).flatten(1).sum(dim=1) / denominator
@@ -351,6 +441,63 @@ def evaluate_denoising_patients(
         naive_bias = (naive_total - target_total) / target_total.clamp_min(1.0)
         metadata = batch.get("meta", [])
         for row_index in range(rate.shape[0]):
+            # Compute all expanded diagnostics after selecting one patient/pair
+            # from the batch.  Aggregating these tensors before this loop would
+            # leak one patient's counts into every other patient's row whenever
+            # ``batch_size > 1``.
+            row_mean = mean[row_index]
+            row_target = target_counts[row_index]
+            row_model_values = model_values[row_index]
+            row_counts_raw = counts_raw[row_index]
+            row_selected = selected[row_index]
+            per_view_target = (row_target * row_selected).sum(dim=(0, 2, 3))
+            per_view_prediction = (row_mean * row_selected).sum(dim=(0, 2, 3))
+            per_view_bias = (per_view_prediction - per_view_target) / per_view_target.clamp_min(1.0e-8)
+            valid_views = per_view_target > 0
+            per_view_abs = per_view_bias.abs()[valid_views]
+            if per_view_abs.numel():
+                per_view_metrics = {
+                    "mean_absolute_bias": float(per_view_abs.mean().cpu()),
+                    "p95_absolute_bias": float(torch.quantile(per_view_abs.float(), 0.95).cpu()),
+                    "maximum_absolute_bias": float(per_view_abs.max().cpu()),
+                    "view_count": float(per_view_abs.numel()),
+                }
+            else:
+                per_view_metrics = {
+                    "mean_absolute_bias": 0.0,
+                    "p95_absolute_bias": 0.0,
+                    "maximum_absolute_bias": 0.0,
+                    "view_count": 0.0,
+                }
+            zero_input = _masked_projection_summary(
+                row_mean, row_target, row_model_values, row_counts_raw == 0, row_selected
+            )
+            low_count_metrics = {
+                "0": _masked_projection_summary(row_mean, row_target, row_model_values, row_counts_raw == 0, row_selected),
+                "1": _masked_projection_summary(row_mean, row_target, row_model_values, row_counts_raw == 1, row_selected),
+                "2": _masked_projection_summary(row_mean, row_target, row_model_values, row_counts_raw == 2, row_selected),
+                "3-5": _masked_projection_summary(
+                    row_mean, row_target, row_model_values, (row_counts_raw >= 3) & (row_counts_raw <= 5), row_selected
+                ),
+                ">5": _masked_projection_summary(row_mean, row_target, row_model_values, row_counts_raw > 5, row_selected),
+            }
+            calibration = {
+                label: _masked_projection_summary(
+                    row_mean,
+                    row_target,
+                    row_model_values,
+                    _range_mask(row_counts_raw, low, high, exclusive_low=label.startswith(">")),
+                    row_selected,
+                )
+                for label, low, high in calibration_ranges
+            }
+            low_signal = _masked_projection_summary(
+                row_mean,
+                row_target,
+                row_model_values,
+                row_target <= low_signal_threshold,
+                row_selected,
+            )
             item_meta = metadata[row_index] if row_index < len(metadata) else {}
             if not isinstance(item_meta, Mapping):
                 item_meta = {}
@@ -365,11 +512,71 @@ def evaluate_denoising_patients(
                     "naive_total_count_bias_fraction": float(naive_bias[row_index].cpu()),
                     "target_total_counts": float(target_total[row_index].cpu()),
                     "selected_bins": float(denominator[row_index].cpu()),
+                    "per_view_bias": {
+                        key: float(value)
+                        for key, value in {
+                            "mean_absolute_bias": per_view_metrics["mean_absolute_bias"],
+                            "p95_absolute_bias": per_view_metrics["p95_absolute_bias"],
+                            "maximum_absolute_bias": per_view_metrics["maximum_absolute_bias"],
+                            "view_count": per_view_metrics["view_count"],
+                        }.items()
+                    },
+                    "zero_input_bin_metrics": {
+                        key: float(value) for key, value in zero_input.items()
+                    },
+                    "low_count_strata": low_count_metrics,
+                    "projection_low_signal_threshold": float(low_signal_threshold),
+                    "projection_low_signal_mask": low_signal,
+                    "calibration_table": calibration,
                 }
             )
     if not rows:
         raise ValueError("patient evaluation produced no rows")
     return rows
+
+
+def _finalize_two_view_window(
+    model: nn.Module,
+    consistency_head: Any,
+    ema_teacher: Any,
+    optimizer: torch.optim.Optimizer,
+    *,
+    scaler: torch.amp.GradScaler | None,
+    autocast_enabled: bool,
+    accumulation_steps: int,
+    pending: int,
+    queued_values: list[Tensor],
+) -> tuple[bool, Tensor]:
+    """Finalize one gradient-accumulation window exactly once.
+
+    The caller owns ``pending`` and resets it after this helper returns.  The
+    representation list is cleared here on both success and failure so a
+    later optimizer window can never re-enqueue historical values.
+    """
+
+    if pending < 1:
+        raise ValueError("cannot finalize an empty optimizer window")
+    if scaler is not None and autocast_enabled:
+        scaler.unscale_(optimizer)
+    if pending < accumulation_steps:
+        correction = accumulation_steps / pending
+        for parameter in list(model.parameters()) + list(consistency_head.parameters()):
+            if parameter.grad is not None:
+                parameter.grad.mul_(correction)
+    parameters = list(model.parameters()) + list(consistency_head.parameters())
+    measured_norm = nn.utils.clip_grad_norm_(parameters, 1.0)
+    successful_step = optimizer_step_succeeded(
+        optimizer,
+        scaler=scaler if autocast_enabled else None,
+        autocast_enabled=autocast_enabled,
+    )
+    optimizer.zero_grad(set_to_none=True)
+    if successful_step:
+        ema_teacher.update(model.backbone)
+        if queued_values:
+            consistency_head.queue.enqueue(torch.cat(queued_values, dim=0))
+    queued_values.clear()
+    return successful_step, measured_norm
 
 
 @torch.no_grad()
@@ -538,32 +745,21 @@ def train_two_view_epoch(
             queued_values.append(loss.queue_values)
         is_last = max_batches is not None and index + 1 >= max_batches
         if pending >= accumulation_steps or is_last:
-            if scaler is not None and autocast_enabled:
-                scaler.unscale_(optimizer)
-            if pending < accumulation_steps:
-                correction = accumulation_steps / pending
-                for parameter in list(model.parameters()) + list(consistency_head.parameters()):
-                    if parameter.grad is not None:
-                        parameter.grad.mul_(correction)
-            parameters = list(model.parameters()) + list(consistency_head.parameters())
-            measured_norm = nn.utils.clip_grad_norm_(parameters, 1.0)
+            successful_step, measured_norm = _finalize_two_view_window(
+                model,
+                consistency_head,
+                ema_teacher,
+                optimizer,
+                scaler=scaler,
+                autocast_enabled=autocast_enabled,
+                accumulation_steps=accumulation_steps,
+                pending=pending,
+                queued_values=queued_values,
+            )
             last_gradient_norm = _record_gradient_norm(measured_norm, gradient_norms)
-            if scaler is not None and autocast_enabled:
-                successful_step = optimizer_step_succeeded(
-                    optimizer, scaler=scaler, autocast_enabled=autocast_enabled
-                )
-            else:
-                successful_step = optimizer_step_succeeded(
-                    optimizer, scaler=None, autocast_enabled=False
-                )
-            optimizer.zero_grad(set_to_none=True)
             if successful_step:
-                ema_teacher.update(model.backbone)
-                if queued_values:
-                    consistency_head.queue.enqueue(torch.cat(queued_values, dim=0))
                 optimizer_steps += 1
             else:
-                queued_values.clear()
                 optimizer_step_skips += 1
             pending = 0
         metric_values.append(
@@ -612,31 +808,21 @@ def train_two_view_epoch(
             )
     if pending:
         autocast_enabled = bool(amp and device.type == "cuda")
-        if scaler is not None and autocast_enabled:
-            scaler.unscale_(optimizer)
-        correction = accumulation_steps / pending
-        for parameter in list(model.parameters()) + list(consistency_head.parameters()):
-            if parameter.grad is not None:
-                parameter.grad.mul_(correction)
-        parameters = list(model.parameters()) + list(consistency_head.parameters())
-        measured_norm = nn.utils.clip_grad_norm_(parameters, 1.0)
+        successful_step, measured_norm = _finalize_two_view_window(
+            model,
+            consistency_head,
+            ema_teacher,
+            optimizer,
+            scaler=scaler,
+            autocast_enabled=autocast_enabled,
+            accumulation_steps=accumulation_steps,
+            pending=pending,
+            queued_values=queued_values,
+        )
         last_gradient_norm = _record_gradient_norm(measured_norm, gradient_norms)
-        if scaler is not None and autocast_enabled:
-            successful_step = optimizer_step_succeeded(
-                optimizer, scaler=scaler, autocast_enabled=autocast_enabled
-            )
-        else:
-            successful_step = optimizer_step_succeeded(
-                optimizer, scaler=None, autocast_enabled=False
-            )
-        optimizer.zero_grad(set_to_none=True)
         if successful_step:
-            ema_teacher.update(model.backbone)
-            if queued_values:
-                consistency_head.queue.enqueue(torch.cat(queued_values, dim=0))
             optimizer_steps += 1
         else:
-            queued_values.clear()
             optimizer_step_skips += 1
     if not metric_values:
         raise ValueError("two-view loader produced no batches")

@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -12,7 +13,11 @@ from gated_spect.losses import (
 )
 from gated_spect.models import ProjectionDenoiser
 from gated_spect.training import train_two_view_epoch, two_view_pretraining_step
-from gated_spect.training.consistency_steps import _representation_health
+from gated_spect.training.consistency_steps import (
+    TwoViewPretrainingLoss,
+    _representation_health,
+)
+from gated_spect.training import runner as training_runner
 
 
 def _view(*, hidden_gate: bool = False) -> dict[str, torch.Tensor]:
@@ -46,6 +51,100 @@ def _view(*, hidden_gate: bool = False) -> dict[str, torch.Tensor]:
 
 
 class ConsistencyTests(unittest.TestCase):
+    def _run_fake_accumulation(self, batch_count: int, *, failed_first: bool = False):
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.tensor(1.0))
+                self.backbone = torch.nn.Linear(1, 1, bias=False)
+
+        class FakeEMA:
+            def __init__(self):
+                self.updates = 0
+
+            def update(self, _backbone):
+                self.updates += 1
+
+        model = TinyModel()
+        head = GlobalConsistencyHead(dimension=1, queue_capacity=64)
+        ema = FakeEMA()
+        optimizer = torch.optim.SGD(
+            list(model.parameters()) + list(head.parameters()), lr=0.1
+        )
+        batches = [
+            {
+                "step": torch.tensor(float(index)),
+                "representation": torch.tensor([[float(2 * index)], [float(2 * index + 1)]]),
+            }
+            for index in range(batch_count)
+        ]
+
+        def fake_step(model, _ema, _head, batch, *, optimizer=None, amp=False, scaler=None):
+            del optimizer, amp, scaler
+            total = model.weight * (batch["step"] + 1.0)
+            zero = total.detach() * 0.0
+            return TwoViewPretrainingLoss(
+                total=total,
+                masked=zero,
+                visible=zero,
+                deviance=zero,
+                latent=zero,
+                gate=zero,
+                variance=zero,
+                queue_values=batch["representation"],
+                health={},
+            )
+
+        step_results = iter([False, True]) if failed_first else None
+        with patch.object(training_runner, "two_view_pretraining_step", fake_step):
+            step_patch = patch.object(
+                training_runner,
+                "optimizer_step_succeeded",
+                side_effect=lambda *args, **kwargs: next(step_results)
+                if step_results is not None
+                else (args[0].step() or True),
+            )
+            with step_patch:
+                metrics = train_two_view_epoch(
+                    model,
+                    batches,
+                    optimizer,
+                    ema,
+                    head,
+                    device="cpu",
+                    accumulation_steps=2,
+                )
+        return metrics, head, ema
+
+    def test_accumulated_queue_inserts_each_window_once(self):
+        metrics, head, ema = self._run_fake_accumulation(4)
+        self.assertEqual(metrics.health["optimizer_steps"], 2.0)
+        self.assertEqual(metrics.health["optimizer_step_skips"], 0.0)
+        self.assertEqual(head.queue.num_entries, 8)
+        torch.testing.assert_close(
+            head.queue.values(), torch.arange(8, dtype=torch.float32).reshape(-1, 1)
+        )
+        self.assertEqual(ema.updates, 2)
+
+    def test_partial_accumulated_queue_inserts_final_window_once(self):
+        metrics, head, ema = self._run_fake_accumulation(5)
+        self.assertEqual(metrics.health["optimizer_steps"], 3.0)
+        self.assertEqual(head.queue.num_entries, 10)
+        torch.testing.assert_close(
+            head.queue.values(), torch.arange(10, dtype=torch.float32).reshape(-1, 1)
+        )
+        self.assertEqual(ema.updates, 3)
+
+    def test_failed_accumulated_amp_window_discards_queue_and_ema(self):
+        metrics, head, ema = self._run_fake_accumulation(4, failed_first=True)
+        self.assertEqual(metrics.health["optimizer_steps"], 1.0)
+        self.assertEqual(metrics.health["optimizer_step_skips"], 1.0)
+        self.assertEqual(head.queue.num_entries, 4)
+        torch.testing.assert_close(
+            head.queue.values(), torch.arange(4, 8, dtype=torch.float32).reshape(-1, 1)
+        )
+        self.assertEqual(ema.updates, 1)
+
     def test_covariance_spectrum_rank_detects_duplicate_features(self) -> None:
         queue = RepresentationQueue(dimension=256, capacity=2048)
         values = torch.randn(64, 1).repeat(1, 256)
@@ -71,9 +170,40 @@ class ConsistencyTests(unittest.TestCase):
     def test_covariance_loss_distinguishes_correlated_features(self) -> None:
         from gated_spect.losses import covariance_offdiagonal_loss
 
-        independent = covariance_offdiagonal_loss(torch.randn(128, 8))
-        duplicate = covariance_offdiagonal_loss(torch.randn(128, 1).repeat(1, 8))
+        independent = covariance_offdiagonal_loss(torch.randn(128, 8), minimum_samples=128)
+        duplicate = covariance_offdiagonal_loss(
+            torch.randn(128, 1).repeat(1, 8), minimum_samples=128
+        )
         self.assertLess(float(independent), float(duplicate))
+
+    def test_covariance_regularizer_is_queue_supported_and_warm_gated(self) -> None:
+        from gated_spect.losses import covariance_offdiagonal_loss
+
+        current = torch.randn(2, 8, requires_grad=True)
+        history = torch.randn(510, 8)
+        loss, ready = covariance_offdiagonal_loss(
+            current, history, minimum_samples=512, return_ready=True
+        )
+        self.assertTrue(ready)
+        self.assertGreater(float(loss), 0.0)
+        loss.backward()
+        self.assertIsNotNone(current.grad)
+        self.assertIsNone(history.grad)
+        cold, cold_ready = covariance_offdiagonal_loss(
+            torch.randn(2, 8), torch.randn(10, 8), minimum_samples=512, return_ready=True
+        )
+        self.assertFalse(cold_ready)
+        self.assertEqual(float(cold), 0.0)
+
+    def test_covariance_regularizer_is_scale_invariant(self) -> None:
+        from gated_spect.losses import covariance_offdiagonal_loss
+
+        values = torch.randn(512, 8)
+        baseline = covariance_offdiagonal_loss(values, minimum_samples=512)
+        scaled_small = covariance_offdiagonal_loss(0.01 * values, minimum_samples=512)
+        scaled_large = covariance_offdiagonal_loss(100.0 * values, minimum_samples=512)
+        self.assertAlmostEqual(float(baseline), float(scaled_small), delta=1.0e-4)
+        self.assertAlmostEqual(float(baseline), float(scaled_large), delta=1.0e-4)
 
     def test_queue_and_variance_warmup(self) -> None:
         queue = RepresentationQueue(dimension=4, capacity=5)

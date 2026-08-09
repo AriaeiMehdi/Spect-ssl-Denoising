@@ -91,17 +91,49 @@ def variance_floor_loss(
     return F.relu(float(target_std) - standard_deviation).mean()
 
 
-def covariance_offdiagonal_loss(projected: Tensor) -> Tensor:
-    """Penalize correlated feature dimensions using a centered covariance matrix."""
+def covariance_offdiagonal_loss(
+    projected: Tensor,
+    history: Tensor | None = None,
+    *,
+    minimum_samples: int = 512,
+    return_ready: bool = False,
+) -> Tensor | tuple[Tensor, bool]:
+    """Penalize standardized off-diagonal feature correlations.
+
+    ``projected`` remains differentiable while ``history`` is explicitly
+    detached.  The historical queue is therefore useful for sample support
+    without allowing gradients to flow through old representations.  The
+    optional regularizer is disabled until ``minimum_samples`` observations
+    are available; diagnostics remain independent of this warm-up gate.
+    """
 
     if projected.ndim != 2:
         raise ValueError("projected must have shape [N,D]")
-    if projected.shape[0] < 2:
-        return projected.new_zeros(())
-    centered = projected.float() - projected.float().mean(dim=0, keepdim=True)
-    covariance = centered.transpose(0, 1).matmul(centered) / float(projected.shape[0] - 1)
-    off_diagonal = covariance - torch.diag_embed(torch.diagonal(covariance))
-    return off_diagonal.square().mean().to(dtype=projected.dtype)
+    if minimum_samples < 2:
+        raise ValueError("minimum_samples must be at least 2")
+    if history is not None:
+        if history.ndim != 2 or history.shape[1] != projected.shape[1]:
+            raise ValueError("history must have shape [N,D] matching projected")
+        history = history.detach().to(device=projected.device, dtype=projected.dtype)
+        values = torch.cat((history, projected), dim=0)
+    else:
+        values = projected
+    ready = values.shape[0] >= minimum_samples
+    if not ready or values.shape[1] < 2:
+        loss = projected.new_zeros(())
+        return (loss, False) if return_ready else loss
+
+    values_float = values.float()
+    centered = values_float - values_float.mean(dim=0, keepdim=True)
+    standard_deviation = centered.std(dim=0, unbiased=True)
+    standardized = centered / (standard_deviation[None, :] + 1.0e-6)
+    correlation = standardized.transpose(0, 1).matmul(standardized) / float(values.shape[0] - 1)
+    diagonal = torch.diagonal(correlation)
+    off_diagonal = correlation - torch.diag_embed(diagonal)
+    dimension = values.shape[1]
+    loss = off_diagonal.square().sum() / float(dimension * (dimension - 1))
+    loss = loss.to(dtype=projected.dtype)
+    return (loss, True) if return_ready else loss
 
 
 @dataclass(frozen=True)
@@ -110,6 +142,7 @@ class GlobalConsistencyLoss:
     cosine: Tensor
     variance: Tensor
     covariance: Tensor
+    covariance_ready: Tensor
     projected_a: Tensor
     projected_b: Tensor
 
@@ -122,6 +155,7 @@ class GlobalConsistencyHead(nn.Module):
         dimension: int = 256,
         queue_capacity: int = 2048,
         covariance_loss_weight: float = 0.0,
+        covariance_min_samples: int = 512,
     ) -> None:
         super().__init__()
         self.projector = LayerNormMLP(dimension, dimension, dimension)
@@ -129,7 +163,10 @@ class GlobalConsistencyHead(nn.Module):
         self.queue = RepresentationQueue(dimension=dimension, capacity=queue_capacity)
         if covariance_loss_weight < 0:
             raise ValueError("covariance_loss_weight must be nonnegative")
+        if covariance_min_samples < 2:
+            raise ValueError("covariance_min_samples must be at least 2")
         self.covariance_loss_weight = float(covariance_loss_weight)
+        self.covariance_min_samples = int(covariance_min_samples)
 
     def forward(self, representation_a: Tensor, representation_b: Tensor) -> GlobalConsistencyLoss:
         projected_a = self.projector(representation_a)
@@ -141,12 +178,18 @@ class GlobalConsistencyHead(nn.Module):
             + stop_gradient_cosine_loss(predicted_b, projected_a)
         )
         variance = variance_floor_loss(torch.cat((projected_a, projected_b), dim=0), self.queue)
-        covariance = covariance_offdiagonal_loss(torch.cat((projected_a, projected_b), dim=0))
+        covariance, covariance_ready = covariance_offdiagonal_loss(
+            torch.cat((projected_a, projected_b), dim=0),
+            self.queue.values(),
+            minimum_samples=self.covariance_min_samples,
+            return_ready=True,
+        )
         return GlobalConsistencyLoss(
             total=cosine + variance + self.covariance_loss_weight * covariance,
             cosine=cosine,
             variance=variance,
             covariance=covariance,
+            covariance_ready=projected_a.new_tensor(float(covariance_ready)),
             projected_a=projected_a,
             projected_b=projected_b,
         )

@@ -6,14 +6,16 @@ gated_spect_pretraining_implementation_plan.md. It is research-only software.
 The current pipeline is scientific-semantics version 2. `ActualFrameDuration`
 is interpreted as acquisition time per angular position, and all exposure-
 dependent artifacts are regenerated under `artifacts\\v2` without overwriting
-legacy v1 files. The migration report at
-`artifacts\\v2\\qc\\exposure_migration_report.json` confirms that the corrected
-standardized exposure inputs are effectively unchanged (mean |delta z| about
-3.45e-15; p99 about 1.07e-14; patient split assignments unchanged), so the
-legacy backbone is a valid explicit transfer candidate. Its old absolute-rate
-decoder is not physically calibrated counts per second. Version-1 caches,
-normalizations, and checkpoints are rejected unless an explicit, passing
-migration gate is supplied.
+legacy v1 files. The preserved historical report at
+`artifacts\\v2\\qc\\exposure_migration_report.json` contains the earlier
+standardized-exposure comparison (mean |delta z| about 3.45e-15; p99 about
+1.07e-14; patient split assignments unchanged), but it predates the exact-file
+hash schema and is intentionally rejected for transfer. Generate a new
+schema-2 report with the exact legacy checkpoint, old/new manifests, splits,
+and normalizations before using `--legacy-backbone-transfer`. Its old
+absolute-rate decoder is not physically calibrated counts per second.
+Version-1 caches, normalizations, and checkpoints are rejected unless an
+explicit, passing exact-artifact migration gate is supplied.
 
 Use the requested interpreter for all commands:
 
@@ -44,6 +46,12 @@ The v1-to-v2 migration decision is generated explicitly and never overwrites
 legacy artifacts:
 
     D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect exposure-migration-audit --help
+
+The migration command requires `--legacy-checkpoint`, both old and new
+Dataset 1/2 manifest paths, and old/new split paths. A bare
+`legacy_backbone_compatibility=true` JSON is not accepted.
+When the report will authorize Dataset2 denoising transfer, also pass
+`--new-dataset2-pairs` so the active pair manifest is bound by its exact hash.
 
 Only a report whose compatibility gate passes may be used with
 `--legacy-backbone-transfer`; the legacy absolute-rate decoder must not be
@@ -82,7 +90,7 @@ gradient clipping, and atomic checkpoint save/load.
 Run a full pretraining job (the smoke-test equivalent uses `--epochs 1
 --max-batches 1`):
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect pretrain --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --manifest artifacts\v2\manifests\dataset1_acquisition.jsonl --splits artifacts\v2\manifests\locked_splits.json --normalization artifacts\v2\manifests\normalization.json --checkpoint artifacts\v2\runs\pretrain_best.pt --metrics-output artifacts\v2\runs\pretrain_metrics.jsonl --epochs 250 --batch-size 1 --accumulation-steps 8 --num-workers 2 --representation-queue-capacity 2048
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect pretrain --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --manifest artifacts\v2\manifests\dataset1_acquisition.jsonl --splits artifacts\v2\manifests\locked_splits.json --normalization artifacts\v2\manifests\normalization.json --checkpoint artifacts\v2\runs\pretrain_best.pt --metrics-output artifacts\v2\runs\pretrain_metrics.jsonl --epochs 250 --batch-size 1 --accumulation-steps 8 --num-workers 2 --representation-queue-capacity 2048 --covariance-min-samples 512
 
 The pretraining command uses two independent student views, an unmasked EMA
 teacher, latent/gate consistency, queue variance regularization, and CUDA AMP
@@ -116,6 +124,12 @@ The pseudocount is a versioned hyperparameter, not a physical constant; run
 matched validation retraining for the planned ablation values 0.5, 0.1, 0.01,
 and 0.001 before selecting it.
 
+When `--patient-metrics-output` is enabled, validation rows also contain
+per-view bias, zero-input-bin metrics, raw-count strata (0, 1, 2, 3-5, >5), a
+projection-domain low-signal proxy, and a configurable calibration table via
+`--low-signal-threshold` and `--calibration-ranges`. These are patient-level
+reporting fields, not anatomical background labels.
+
 The reproducible launchers are `scripts/run_pseudocount_ablation.py` and
 `scripts/run_matched_denoising.py`. Pass `--patient-metrics-output` (included
 by both launchers) to retain validation rows with patient IDs, then create a
@@ -127,6 +141,10 @@ Matched mode requires at least three common seeds. The report selects epochs
 from validation only, averages duplicate pair rows within patient, and marks
 the SSL improvement criterion as supported only when the patient-bootstrap
 95% CI for pretrained-minus-scratch deviance is below zero.
+
+Use `scripts/run_matched_denoising.py --dry-run` to inspect the matched
+protocol. Its default is `--freeze-epochs 0` (`full_finetune`), and each real
+checkpoint records decoder/backbone initialization fingerprints.
 
 Save a detector-slice comparison for one accepted Dataset 2 pair. The
 visualizer checks the checkpoint's recorded decoder mode and refuses to load a

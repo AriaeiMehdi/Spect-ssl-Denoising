@@ -29,6 +29,10 @@ def main() -> int:
     parser.add_argument("--accumulation-steps", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--frame-chunk-size", type=int, default=128)
+    parser.add_argument("--low-signal-threshold", type=float, default=5.0)
+    parser.add_argument(
+        "--calibration-ranges", default="0,1,2,3-5,6-10,11-20,>20"
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -76,6 +80,10 @@ def main() -> int:
                 str(args.frame_chunk_size),
                 "--baseline-pseudocount",
                 str(alpha),
+                "--low-signal-threshold",
+                str(args.low_signal_threshold),
+                "--calibration-ranges",
+                args.calibration_ranges,
                 "--seed",
                 str(seed),
             ]
