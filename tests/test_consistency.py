@@ -166,6 +166,7 @@ class ConsistencyTests(unittest.TestCase):
         values = torch.randn(32, 16, dtype=torch.float16)
         health = _representation_health(values, RepresentationQueue(dimension=16))
         self.assertTrue(torch.isfinite(health["p95_absolute_offdiagonal_correlation"]))
+        self.assertLessEqual(float(health["max_absolute_offdiagonal_correlation"]), 1.0)
 
     def test_covariance_loss_distinguishes_correlated_features(self) -> None:
         from gated_spect.losses import covariance_offdiagonal_loss

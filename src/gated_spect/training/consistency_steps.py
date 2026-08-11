@@ -26,6 +26,7 @@ class TwoViewPretrainingLoss:
     latent: Tensor
     gate: Tensor
     variance: Tensor
+    masked_deviance: Tensor | None = None
     queue_values: Tensor | None = None
     health: dict[str, Tensor] = field(default_factory=dict)
 
@@ -55,7 +56,10 @@ def _representation_health(projected: Tensor, queue: Any) -> dict[str, Tensor]:
         standard_deviation = covariance.diagonal().clamp_min(1.0e-12).sqrt()
         correlation = covariance / (standard_deviation[:, None] * standard_deviation[None, :]).clamp_min(1.0e-12)
         off_diagonal = ~torch.eye(values.shape[1], dtype=torch.bool, device=values.device)
-        absolute_off_diagonal = correlation.abs()[off_diagonal]
+        # Round-off in half precision can produce |rho| slightly above one;
+        # diagnostics represent a correlation coefficient and must stay in its
+        # mathematical range rather than reporting an impossible collapse value.
+        absolute_off_diagonal = correlation.abs().clamp_max(1.0)[off_diagonal]
         if absolute_off_diagonal.numel() == 0:
             absolute_off_diagonal = values.new_zeros((1,))
     else:
@@ -179,6 +183,7 @@ def two_view_pretraining_step(
         masked = 0.5 * (loss_a.masked + loss_b.masked)
         visible = 0.5 * (loss_a.visible + loss_b.visible)
         deviance = 0.5 * (loss_a.deviance + loss_b.deviance)
+        masked_deviance = 0.5 * (loss_a.masked_deviance + loss_b.masked_deviance)
         total = masked + 0.25 * visible + 0.05 * global_loss.total + 0.05 * gate_loss
         health = {
             key: 0.5 * (loss_a.health[key] + loss_b.health[key])
@@ -227,6 +232,7 @@ def two_view_pretraining_step(
         masked=masked,
         visible=visible,
         deviance=deviance,
+        masked_deviance=masked_deviance,
         latent=global_loss.cosine,
         gate=gate_loss,
         variance=global_loss.variance,

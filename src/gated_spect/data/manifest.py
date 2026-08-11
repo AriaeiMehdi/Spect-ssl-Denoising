@@ -14,7 +14,7 @@ import pydicom
 from ..types import ReaderConfig
 from .dicom_reader import read_nm_dicom, stable_identity_key
 from .splits import SplitConfig, make_dataset1_splits, make_dataset2_splits
-from ..versioning import artifact_version_metadata
+from ..versioning import artifact_version_metadata, sha256_file, write_text_create_only
 
 
 def _root_id(root: Path) -> str:
@@ -50,6 +50,7 @@ def build_acquisition_manifest(
             "source_root_id": _root_id(root_path),
             "parse_status": "error",
             "training_eligible": False,
+            "source_sha256": sha256_file(path),
         }
         try:
             sample = read_nm_dicom(path, config)
@@ -113,12 +114,11 @@ def build_acquisition_manifest(
 
 def write_manifest(rows: Iterable[Mapping[str, Any]], output: str | Path) -> Path:
     destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(rows, key=lambda row: str(row.get("relative_path", "")))
-    with destination.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in ordered:
-            handle.write(json.dumps(dict(row), sort_keys=True, allow_nan=False) + "\n")
-    return destination
+    text = "".join(
+        json.dumps(dict(row), sort_keys=True, allow_nan=False) + "\n" for row in ordered
+    )
+    return write_text_create_only(destination, text)
 
 
 def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
@@ -133,6 +133,9 @@ def write_locked_splits(
     *,
     output: str | Path,
     config: SplitConfig = SplitConfig(),
+    dataset1_manifest_sha256: str | None = None,
+    dataset2_manifest_sha256: str | None = None,
+    pair_manifest_sha256: str | None = None,
 ) -> Path:
     """Write patient-level splits using only accepted Dataset 2 pair patients."""
 
@@ -166,8 +169,11 @@ def write_locked_splits(
         "dataset1": dataset1_splits,
         "accepted_dataset2_patient_count": len(accepted_patients),
         "excluded_from_dataset1": sorted(validation_test_patients),
+        "dataset1_manifest_sha256": dataset1_manifest_sha256,
+        "dataset2_manifest_sha256": dataset2_manifest_sha256,
+        "pair_manifest_sha256": pair_manifest_sha256,
     }
     destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    return destination
+    return write_text_create_only(
+        destination, json.dumps(payload, sort_keys=True, indent=2) + "\n"
+    )

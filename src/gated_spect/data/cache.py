@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,19 @@ class StaleCacheError(IncompatibleArtifactError):
     """Raised when a cache was created under incompatible semantics."""
 
 
+_REQUIRED_CHECKSUM_FILES = frozenset(
+    {
+        "counts.npy",
+        "frame_exposure_s.npy",
+        "relative_exposure_q.npy",
+        "valid_frames.npy",
+        "radius_valid.npy",
+        "geometry.npz",
+        "metadata.json",
+    }
+)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -36,9 +50,28 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     path.write_text(json.dumps(value, sort_keys=True, indent=2), encoding="utf-8")
 
 
-def write_sample_cache(sample: GatedSPECTSample, root: str | Path) -> Path:
+def write_sample_cache(
+    sample: GatedSPECTSample,
+    root: str | Path,
+    *,
+    source_relative_path: str | None = None,
+    source_sha256: str | None = None,
+    manifest_sha256: str | None = None,
+    manifest_row_sha256: str | None = None,
+) -> Path:
     """Write an accepted sample atomically and return its final directory."""
 
+    provenance = {
+        "source_relative_path": source_relative_path,
+        "source_sha256": source_sha256,
+        "manifest_sha256": manifest_sha256,
+        "manifest_row_sha256": manifest_row_sha256,
+    }
+    if any(not isinstance(value, str) or not value for value in provenance.values()):
+        raise ValueError(
+            "schema-3 cache writes require source_relative_path, source_sha256, "
+            "manifest_sha256, and manifest_row_sha256"
+        )
     root_path = Path(root)
     root_path.mkdir(parents=True, exist_ok=True)
     final = root_path / sample.sample_id
@@ -53,7 +86,33 @@ def write_sample_cache(sample: GatedSPECTSample, root: str | Path) -> Path:
             )
         existing_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         _validate_cache_versions(existing_metadata, final)
+        expected_metadata = {
+            "sample_id": sample.sample_id,
+            "geometry_hash": sample.geometry_hash,
+        }
+        if source_relative_path is not None:
+            expected_metadata["source_relative_path"] = source_relative_path
+        if source_sha256 is not None:
+            expected_metadata["source_sha256"] = source_sha256
+        if manifest_sha256 is not None:
+            expected_metadata["manifest_sha256"] = manifest_sha256
+        if manifest_row_sha256 is not None:
+            expected_metadata["manifest_row_sha256"] = manifest_row_sha256
+        mismatches = [
+            f"{key}={existing_metadata.get(key)!r} (candidate {value!r})"
+            for key, value in expected_metadata.items()
+            if existing_metadata.get(key) != value
+        ]
+        if mismatches:
+            raise StaleCacheError(
+                f"cache {final} provenance does not match the candidate sample: "
+                + "; ".join(mismatches)
+            )
         expected = json.loads(existing_checksums.read_text(encoding="utf-8"))
+        if set(expected) != _REQUIRED_CHECKSUM_FILES:
+            raise StaleCacheError(
+                f"cache {final} has an incomplete checksum bundle; regenerate schema 3"
+            )
         for name, checksum in expected.items():
             if not (final / name).exists() or _sha256(final / name) != checksum:
                 raise IOError(f"cache checksum mismatch for {final / name}")
@@ -89,7 +148,7 @@ def write_sample_cache(sample: GatedSPECTSample, root: str | Path) -> Path:
             "detector_stream": sample.detector_stream,
             "geometry_hash": sample.geometry_hash,
             "exposure_source": sample.exposure_source,
-            "source_path": sample.source_path,
+            **provenance,
             "metadata": dict(sample.metadata),
         }
         _write_json(temp / "metadata.json", metadata)
@@ -127,6 +186,10 @@ def read_sample_cache(path: str | Path, *, mmap_counts: bool = True) -> GatedSPE
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     _validate_cache_versions(metadata, directory)
     checksums = json.loads((directory / "checksums.json").read_text(encoding="utf-8"))
+    if set(checksums) != _REQUIRED_CHECKSUM_FILES:
+        raise StaleCacheError(
+            f"cache {directory} has an incomplete checksum bundle; regenerate schema 3"
+        )
     for name, expected in checksums.items():
         actual_path = directory / name
         if not actual_path.exists() or _sha256(actual_path) != expected:
@@ -153,7 +216,7 @@ def read_sample_cache(path: str | Path, *, mmap_counts: bool = True) -> GatedSPE
         study_key=str(metadata["study_key"]),
         geometry_hash=str(metadata["geometry_hash"]),
         exposure_source=str(metadata["exposure_source"]),
-        source_path=str(metadata["source_path"]),
+        source_path=str(metadata.get("source_relative_path", metadata.get("source_path", ""))),
         metadata=metadata.get("metadata", {}),
     )
 
@@ -175,4 +238,29 @@ def _validate_cache_versions(metadata: dict[str, Any], directory: Path) -> None:
         raise StaleCacheError(
             f"cache {directory} is incompatible with scientific semantics v2: {details}; "
             "preserve the legacy cache and regenerate under cache_v2"
+        )
+    provenance_keys = (
+        "source_relative_path",
+        "source_sha256",
+        "manifest_sha256",
+        "manifest_row_sha256",
+    )
+    missing_provenance = [
+        key
+        for key in provenance_keys
+        if not isinstance(metadata.get(key), str) or not metadata[key]
+    ]
+    invalid_hashes = [
+        key
+        for key in provenance_keys[1:]
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(metadata.get(key, "")))
+    ]
+    source_relative = Path(str(metadata.get("source_relative_path", "")))
+    if source_relative.is_absolute() or ".." in source_relative.parts:
+        invalid_hashes.append("source_relative_path")
+    if missing_provenance or invalid_hashes:
+        details = ", ".join(missing_provenance + invalid_hashes)
+        raise StaleCacheError(
+            f"cache {directory} lacks valid schema-3 provenance: {details}; "
+            "regenerate it from a source-bound manifest"
         )

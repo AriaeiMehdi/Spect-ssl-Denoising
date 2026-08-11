@@ -5,7 +5,7 @@ from pathlib import Path
 import unittest
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
 from gated_spect.data import (
     AcquisitionDataset,
@@ -21,7 +21,7 @@ from gated_spect.types import ReaderConfig
 
 
 DATA_ROOT = Path(r"D:\Dr.EntezarMahdi\3DRecon\datasets")
-MANIFEST = Path(r"D:\Dr.EntezarMahdi\3DRecon\artifacts\manifests\dataset1_acquisition.jsonl")
+MANIFEST = Path(r"D:\Dr.EntezarMahdi\3DRecon\artifacts\v2\manifests\dataset1_acquisition.jsonl")
 HAS_DATA = DATA_ROOT.joinpath("Pre-training dataset").exists() and MANIFEST.exists()
 
 
@@ -112,6 +112,41 @@ class PairVocabularyTests(unittest.TestCase):
         self.assertEqual(dataset.scanner_vocab, {"scanner-pretrained": 1})
         self.assertEqual(dataset.collimator_vocab, {"collimator-pretrained": 1})
         self.assertEqual(dataset.stress_vocab, {"rest": 1})
+
+
+class DataLoaderGeneratorTests(unittest.TestCase):
+    def test_generator_state_restores_order_after_validation_iterator(self) -> None:
+        dataset = TensorDataset(torch.arange(12, dtype=torch.int64))
+        train_generator = torch.Generator(device="cpu").manual_seed(101)
+        validation_generator = torch.Generator(device="cpu").manual_seed(202)
+        train_loader = DataLoader(
+            dataset, batch_size=3, shuffle=True, generator=train_generator
+        )
+        validation_loader = DataLoader(
+            dataset, batch_size=4, shuffle=False, generator=validation_generator
+        )
+
+        first_order = [batch[0].tolist() for batch in train_loader]
+        _ = [batch[0].tolist() for batch in validation_loader]
+        saved_train = train_generator.get_state()
+        saved_validation = validation_generator.get_state()
+        uninterrupted_next = [batch[0].tolist() for batch in train_loader]
+
+        restored_train = torch.Generator(device="cpu")
+        restored_validation = torch.Generator(device="cpu")
+        restored_train.set_state(saved_train)
+        restored_validation.set_state(saved_validation)
+        resumed_train_loader = DataLoader(
+            dataset, batch_size=3, shuffle=True, generator=restored_train
+        )
+        resumed_validation_loader = DataLoader(
+            dataset, batch_size=4, shuffle=False, generator=restored_validation
+        )
+        _ = [batch[0].tolist() for batch in resumed_validation_loader]
+        resumed_next = [batch[0].tolist() for batch in resumed_train_loader]
+
+        self.assertEqual(len(first_order), 4)
+        self.assertEqual(uninterrupted_next, resumed_next)
 
 
 if __name__ == "__main__":

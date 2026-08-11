@@ -481,6 +481,7 @@ def collate_acquisitions(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "meta": [],
     }
     optional_specs = {
+        "input_counts_raw": torch.int64,
         "target_counts": torch.int64,
         "target_exposure_s": torch.float32,
         "target_weight": torch.float32,
@@ -489,7 +490,11 @@ def collate_acquisitions(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     }
     for key, dtype in optional_specs.items():
         if key in items[0]:
-            shape = (max_g, max_v, h, w) if key in {"target_counts", "masked_target", "visible_target"} else (max_g, max_v)
+            shape = (
+                (max_g, max_v, h, w)
+                if key in {"input_counts_raw", "target_counts", "masked_target", "visible_target"}
+                else (max_g, max_v)
+            )
             batch[key] = torch.zeros((b, *shape), dtype=dtype)
     for row, item in enumerate(items):
         g, v = item["valid_frames"].shape

@@ -5,6 +5,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import numpy as np
+
 from gated_spect.data.dicom_reader import read_nm_dicom
 from gated_spect.data.migration import build_exposure_migration_report
 from gated_spect.training.checkpoint_contract import sha256_file
@@ -131,6 +133,98 @@ class MigrationTests(unittest.TestCase):
             )
             self.assertFalse(missing_sample_report["geometry_inputs_unchanged"])
             self.assertFalse(missing_sample_report["legacy_backbone_compatibility"])
+
+    def test_radius_normalization_change_cannot_authorize_transfer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.dcm"
+            write_fixture(source, actual_frame_duration_ms=10_000, views=32)
+            sample = read_nm_dicom(source, ReaderConfig(hash_key=b"test-secret"))
+            old_norm = root / "old_norm.json"
+            new_norm = root / "new_norm.json"
+            common = {
+                "count_log_mean": 0.0,
+                "count_log_std": 1.0,
+                "log_exposure_std": 1.0,
+                "radius_std_mm": 1.0,
+            }
+            old_norm.write_text(
+                json.dumps(
+                    {
+                        "stats": {
+                            **common,
+                            "log_exposure_mean": float(np.log(10.0 / 32.0)),
+                            "radius_mean_mm": 0.0,
+                        },
+                        "element_counts": {
+                            "files": 1,
+                            "count_elements": 1,
+                            "exposure_elements": 1,
+                            "radius_elements": 1,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            new_norm.write_text(
+                json.dumps(
+                    {
+                        "stats": {
+                            **common,
+                            "log_exposure_mean": float(np.log(10.0)),
+                            "radius_mean_mm": 5.0,
+                        },
+                        "element_counts": {
+                            "files": 1,
+                            "count_elements": 1,
+                            "exposure_elements": 1,
+                            "radius_elements": 1,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manifest = [
+                {
+                    "parse_status": "parsed",
+                    "relative_path": source.name,
+                    "sample_id": sample.sample_id,
+                    "geometry_hash": sample.geometry_hash,
+                }
+            ]
+            old_d1 = root / "old_d1.jsonl"
+            new_d1 = root / "new_d1.jsonl"
+            old_d2 = root / "old_d2.jsonl"
+            new_d2 = root / "new_d2.jsonl"
+            for path in (old_d1, new_d1, old_d2, new_d2):
+                path.write_text("{}\n", encoding="utf-8")
+            old_splits = root / "old_splits.json"
+            new_splits = root / "new_splits.json"
+            split_payload = {"dataset1": {"patient": "pretrain"}, "dataset2": {}}
+            old_splits.write_text(json.dumps(split_payload), encoding="utf-8")
+            new_splits.write_text(json.dumps(split_payload), encoding="utf-8")
+            checkpoint = root / "legacy.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            report = build_exposure_migration_report(
+                (("dataset1", root, manifest),),
+                config=ReaderConfig(hash_key=b"test-secret"),
+                old_normalization=old_norm,
+                new_normalization=new_norm,
+                new_manifests={"dataset1": manifest},
+                old_splits=split_payload,
+                new_splits=split_payload,
+                legacy_checkpoint=checkpoint,
+                old_dataset1_manifest=old_d1,
+                new_dataset1_manifest=new_d1,
+                old_dataset2_manifest=old_d2,
+                new_dataset2_manifest=new_d2,
+                old_splits_path=old_splits,
+                new_splits_path=new_splits,
+            )
+            self.assertTrue(report["exact_sample_coverage"])
+            self.assertTrue(report["element_counts_unchanged"])
+            self.assertFalse(report["radius_normalization_unchanged"])
+            self.assertFalse(report["legacy_backbone_compatibility"])
 
 
 if __name__ == "__main__":

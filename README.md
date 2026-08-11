@@ -4,19 +4,14 @@ This repository is being implemented from
 gated_spect_pretraining_implementation_plan.md. It is research-only software.
 
 The current pipeline is scientific-semantics version 2. `ActualFrameDuration`
-is interpreted as acquisition time per angular position, and all exposure-
-dependent artifacts are regenerated under `artifacts\\v2` without overwriting
-legacy v1 files. The preserved historical report at
-`artifacts\\v2\\qc\\exposure_migration_report.json` contains the earlier
-standardized-exposure comparison (mean |delta z| about 3.45e-15; p99 about
-1.07e-14; patient split assignments unchanged), but it predates the exact-file
-hash schema and is intentionally rejected for transfer. Generate a new
-schema-2 report with the exact legacy checkpoint, old/new manifests, splits,
-and normalizations before using `--legacy-backbone-transfer`. The current
-non-overwriting schema-2 report is
-`artifacts\\v2\\qc\\exposure_migration_report_schema2.json`; it also binds the
-active Dataset2 pair manifest. Its old
-absolute-rate decoder is not physically calibrated counts per second.
+is interpreted as acquisition time per angular position. Fresh, create-only
+artifacts are under `artifacts\\v2\\fresh_20260811` (and strict cache evidence
+under `artifacts\\v2\\fresh_20260811_strict`); recovered v1 files remain under
+`artifacts\\recovery\\v1_exact`. The strict migration report
+`artifacts\\v2\\fresh_20260811\\qc\\exposure_migration_report_schema2_strict_v2.json`
+contains exact hashes, 1,521 error-free sample comparisons, and the legacy
+compatibility decision. Its old absolute-rate decoder is not physically
+calibrated counts per second.
 Version-1 caches, normalizations, and checkpoints are rejected unless an
 explicit, passing exact-artifact migration gate is supplied.
 
@@ -75,13 +70,14 @@ Do not use --allow-unhashed for real data.
 
 Build the parsed acquisition manifests and lock the patient-level splits:
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect manifest --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --dataset-id dataset1 --output artifacts\v2\manifests\dataset1_acquisition.jsonl
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect manifest --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --dataset-id dataset2 --output artifacts\v2\manifests\dataset2_acquisition.jsonl
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect lock-splits --dataset1-manifest artifacts\v2\manifests\dataset1_acquisition.jsonl --dataset2-manifest artifacts\v2\manifests\dataset2_acquisition.jsonl --pair-manifest artifacts\v2\manifests\denoising_pairs.jsonl --output artifacts\v2\manifests\locked_splits.json --seed 20260806
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect manifest --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --dataset-id dataset1 --output artifacts\v2\fresh_20260811\manifests\dataset1_acquisition.jsonl
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect manifest --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --dataset-id dataset2 --output artifacts\v2\fresh_20260811\manifests\dataset2_acquisition.jsonl
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect pair-audit --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --output artifacts\v2\fresh_20260811\manifests\denoising_pairs.jsonl
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect lock-splits --dataset1-manifest artifacts\v2\fresh_20260811\manifests\dataset1_acquisition.jsonl --dataset2-manifest artifacts\v2\fresh_20260811\manifests\dataset2_acquisition.jsonl --pair-manifest artifacts\v2\fresh_20260811\manifests\denoising_pairs.jsonl --output artifacts\v2\fresh_20260811\manifests\locked_splits.json --seed 20260806
 
 Compute the frozen Dataset 1 training normalization statistics:
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect normalization --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --manifest artifacts\v2\manifests\dataset1_acquisition.jsonl --splits artifacts\v2\manifests\locked_splits.json --output artifacts\v2\manifests\normalization.json
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect normalization --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --manifest artifacts\v2\fresh_20260811\manifests\dataset1_acquisition.jsonl --splits artifacts\v2\fresh_20260811\manifests\locked_splits.json --output artifacts\v2\fresh_20260811\manifests\normalization.json
 
 The PyTorch data layer is in
 `src/gated_spect/data/torch_dataset.py`; `PretrainingDataset` performs the
@@ -93,7 +89,7 @@ gradient clipping, and atomic checkpoint save/load.
 Run a full pretraining job (the smoke-test equivalent uses `--epochs 1
 --max-batches 1`):
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect pretrain --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --manifest artifacts\v2\manifests\dataset1_acquisition.jsonl --splits artifacts\v2\manifests\locked_splits.json --normalization artifacts\v2\manifests\normalization.json --checkpoint artifacts\v2\runs\pretrain_best.pt --metrics-output artifacts\v2\runs\pretrain_metrics.jsonl --epochs 250 --batch-size 1 --accumulation-steps 8 --num-workers 2 --representation-queue-capacity 2048 --covariance-min-samples 512
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect pretrain --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Pre-training dataset" --manifest artifacts\v2\fresh_20260811\manifests\dataset1_acquisition.jsonl --splits artifacts\v2\fresh_20260811\manifests\locked_splits.json --normalization artifacts\v2\fresh_20260811\manifests\normalization.json --checkpoint artifacts\v2\fresh_20260811\runs\pretrain_best.pt --metrics-output artifacts\v2\fresh_20260811\runs\pretrain_metrics.jsonl --epochs 250 --warmup-epochs 10 --early-stop-patience 30 --batch-size 1 --accumulation-steps 8 --num-workers 2 --representation-queue-capacity 2048 --covariance-min-samples 512
 
 The pretraining command uses two independent student views, an unmasked EMA
 teacher, latent/gate consistency, queue variance regularization, and CUDA AMP
@@ -104,18 +100,23 @@ checkpointing while preserving all 512 projections and attention semantics;
 it trades extra computation for lower peak GPU memory.
 At startup it prints a JSON model/data summary, including total and trainable
 parameter counts. It then prints a batch event every 10 batches by default and
-an epoch summary with loss components, Poisson deviance, masking coverage,
+an epoch summary with loss components, union and literal masked-only Poisson
+deviance, masking coverage,
 prediction-rate statistics, representation variance/effective rank, gradient
 norm, AMP scale, throughput, and elapsed time. Batch and epoch events are also
 persisted to a sibling `*.events.jsonl` file; customize the cadence or path
 with `--log-interval` and `--log-output`.
+If a run is interrupted after a guarded checkpoint is written, resume it with
+the same artifact paths and `--resume`; optimizer, schedule, AMP scaler,
+EMA/queue, and process RNG state are restored. Existing artifacts are never
+replaced unless `--overwrite` is explicit.
 
 Fine-tune the pretrained backbone on the locked Dataset 2 pairs. The default
 baseline-residual decoder learns a bounded multiplicative correction around the
 exposure-scaled 10-second input, which preserves count scale while learning the
 30-second structure:
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\manifests\denoising_pairs.jsonl --splits artifacts\v2\manifests\locked_splits.json --normalization artifacts\v2\manifests\normalization.json --pretrained-checkpoint artifacts\runs\pretrain_best.pt --legacy-backbone-transfer --exposure-migration-report artifacts\v2\qc\exposure_migration_report_schema2.json --checkpoint artifacts\v2\runs\denoise_residual_best40.pt --metrics-output artifacts\v2\runs\denoise_residual_best40_metrics.jsonl --log-output artifacts\v2\runs\denoise_residual_best40_events.jsonl --epochs 40 --freeze-epochs 8 --batch-size 1 --accumulation-steps 8 --num-workers 1 --frame-chunk-size 128 --baseline-pseudocount 0.5
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\fresh_20260811\manifests\denoising_pairs.jsonl --dataset1-manifest artifacts\v2\fresh_20260811\manifests\dataset1_acquisition.jsonl --dataset2-manifest artifacts\v2\fresh_20260811\manifests\dataset2_acquisition.jsonl --splits artifacts\v2\fresh_20260811\manifests\locked_splits.json --normalization artifacts\v2\fresh_20260811\manifests\normalization.json --pretrained-checkpoint artifacts\v2\fresh_20260811\runs\pretrain_best.pt --checkpoint artifacts\v2\fresh_20260811\runs\denoise_residual_best40.pt --metrics-output artifacts\v2\fresh_20260811\runs\denoise_residual_best40_metrics.jsonl --log-output artifacts\v2\fresh_20260811\runs\denoise_residual_best40_events.jsonl --epochs 40 --freeze-epochs 8 --batch-size 1 --accumulation-steps 8 --num-workers 1 --frame-chunk-size 128 --baseline-pseudocount 0.5
 
 The denoiser command initializes only the backbone from the pretrained
 checkpoint, creates a fresh rate decoder, freezes the frame encoder/first
@@ -153,7 +154,7 @@ Save a detector-slice comparison for one accepted Dataset 2 pair. The
 visualizer checks the checkpoint's recorded decoder mode and refuses to load a
 residual checkpoint with the non-residual interpretation (or vice versa):
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect visualize-denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\manifests\denoising_pairs.jsonl --normalization artifacts\v2\manifests\normalization.json --pretrained-checkpoint artifacts\runs\pretrain_best.pt --legacy-backbone-transfer --exposure-migration-report artifacts\v2\qc\exposure_migration_report_schema2.json --checkpoint artifacts\v2\runs\denoise_residual_best40.pt --output artifacts\v2\visualizations\denoise_residual_pair0.png --pair-index 0 --gate-index 0 --view-index 0 --frame-chunk-size 128
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect visualize-denoise --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\fresh_20260811\manifests\denoising_pairs.jsonl --normalization artifacts\v2\fresh_20260811\manifests\normalization.json --pretrained-checkpoint artifacts\v2\fresh_20260811\runs\pretrain_best.pt --checkpoint artifacts\v2\fresh_20260811\runs\denoise_residual_best40.pt --output artifacts\v2\fresh_20260811\visualizations\denoise_residual_pair0.png --pair-index 0 --gate-index 0 --view-index 0 --frame-chunk-size 128
 
 The saved PNG contains three panels: the 10-second low-count input, the
 denoiser prediction converted to expected counts at the high acquisition's
@@ -166,7 +167,7 @@ Export three locked validation pairs as derived multi-frame Nuclear Medicine
 DICOM projection stacks for import into a commercial SPECT reconstruction
 application:
 
-    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect export-denoise-dicom --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\manifests\denoising_pairs.jsonl --splits artifacts\manifests\locked_splits.json --normalization artifacts\manifests\normalization.json --pretrained-checkpoint artifacts\runs\pretrain_best.pt --checkpoint artifacts\runs\denoise_residual_best40.pt --output-dir artifacts\denoising_dicom_validation3 --count 3 --frame-chunk-size 128
+    D:\global environment\torch_cuda124\Scripts\python.exe -m gated_spect export-denoise-dicom --root "D:\Dr.EntezarMahdi\3DRecon\datasets\Denoising dataset" --pairs artifacts\v2\fresh_20260811\manifests\denoising_pairs.jsonl --splits artifacts\v2\fresh_20260811\manifests\locked_splits.json --normalization artifacts\v2\fresh_20260811\manifests\normalization.json --pretrained-checkpoint artifacts\v2\fresh_20260811\runs\pretrain_best.pt --checkpoint artifacts\v2\fresh_20260811\runs\denoise_residual_best40.pt --output-dir artifacts\v2\fresh_20260811\denoising_dicom_validation3 --count 3 --frame-chunk-size 128
 
 Each `pair_*` directory contains `input_10s_projection.dcm`,
 `denoised_expected_30s_projection.dcm`, and `target_30s_projection.dcm`.

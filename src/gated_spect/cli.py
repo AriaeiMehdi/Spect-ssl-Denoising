@@ -8,6 +8,7 @@ import json
 import math
 import os
 import platform
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -30,7 +31,15 @@ from .data.manifest import (
 from .data.pair_manifest import audit_duration_pairs, write_pair_manifest
 from .data.splits import SplitConfig
 from .types import ReaderConfig
-from .versioning import artifact_version_metadata, require_artifact_versions
+from .versioning import (
+    artifact_version_metadata,
+    require_artifact_versions,
+    validate_manifest_source_bindings,
+    validate_normalization_binding,
+    validate_pair_source_bindings,
+    validate_resume_contract,
+    write_text_create_only,
+)
 from .training.checkpoint_contract import (
     sha256_file,
     state_dict_sha256,
@@ -41,6 +50,7 @@ from .training.checkpoint_contract import (
 def environment_report() -> dict[str, Any]:
     """Return the runtime facts that are saved beside each experiment."""
 
+    lockfile = Path(__file__).resolve().parents[2] / "requirements.lock"
     return {
         "python": sys.version,
         "platform": platform.platform(),
@@ -49,6 +59,7 @@ def environment_report() -> dict[str, Any]:
         "scipy": scipy.__version__,
         "pydicom": pydicom.__version__,
         "torch": torch.__version__,
+        "requirements_lock_sha256": sha256_file(lockfile) if lockfile.is_file() else None,
         "cuda_available": bool(torch.cuda.is_available()),
         "cuda_device_count": int(torch.cuda.device_count()),
         "cuda_devices": [
@@ -57,12 +68,33 @@ def environment_report() -> dict[str, Any]:
     }
 
 
+def code_revision_report() -> dict[str, Any]:
+    """Record the source revision and dirty state alongside checkpoints."""
+
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        revision, dirty = None, None
+    return {"git_revision": revision, "git_dirty": dirty}
+
+
 def _write_or_print(payload: Any, output: str | None) -> None:
     text = json.dumps(payload, indent=2, sort_keys=True)
     if output:
-        destination = Path(output)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text + "\n", encoding="utf-8")
+        write_text_create_only(output, text + "\n")
     else:
         print(text)
 
@@ -207,6 +239,20 @@ def _build_parser() -> argparse.ArgumentParser:
     pretrain_parser.add_argument("--splits", required=True)
     pretrain_parser.add_argument("--normalization", required=True)
     pretrain_parser.add_argument("--checkpoint", required=True)
+    pretrain_parser.add_argument(
+        "--latest-checkpoint",
+        help="latest resumable checkpoint; defaults to <checkpoint stem>_latest.pt",
+    )
+    pretrain_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume optimizer, scheduler, AMP, EMA, queue, and RNG state from --checkpoint",
+    )
+    pretrain_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="explicitly allow replacing existing run outputs; default is fail-closed",
+    )
     pretrain_parser.add_argument("--metrics-output")
     pretrain_parser.add_argument(
         "--log-output",
@@ -219,6 +265,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print and persist a batch event every N batches (0 disables batch events)",
     )
     pretrain_parser.add_argument("--epochs", type=int, default=250)
+    pretrain_parser.add_argument("--warmup-epochs", type=int, default=10)
+    pretrain_parser.add_argument("--early-stop-patience", type=int, default=30)
+    pretrain_parser.add_argument("--minimum-learning-rate", type=float, default=1.0e-6)
+    pretrain_parser.add_argument("--minimum-representation-std", type=float, default=0.01)
     pretrain_parser.add_argument("--batch-size", type=int, default=1)
     pretrain_parser.add_argument(
         "--frame-chunk-size",
@@ -256,6 +306,16 @@ def _build_parser() -> argparse.ArgumentParser:
     denoise_parser = subparsers.add_parser("denoise")
     denoise_parser.add_argument("--root", required=True)
     denoise_parser.add_argument("--pairs", required=True)
+    denoise_parser.add_argument(
+        "--dataset1-manifest",
+        required=True,
+        help="Dataset1 manifest bound to the normalization statistics",
+    )
+    denoise_parser.add_argument(
+        "--dataset2-manifest",
+        required=True,
+        help="Dataset2 acquisition manifest bound to the locked splits",
+    )
     denoise_parser.add_argument("--splits", required=True)
     denoise_parser.add_argument("--normalization", required=True)
     denoise_parser.add_argument("--pretrained-checkpoint", required=True)
@@ -515,6 +575,9 @@ def main(argv: list[str] | None = None) -> int:
             pair_rows,
             output=args.output,
             config=config,
+            dataset1_manifest_sha256=sha256_file(args.dataset1_manifest),
+            dataset2_manifest_sha256=sha256_file(args.dataset2_manifest),
+            pair_manifest_sha256=sha256_file(args.pair_manifest),
         )
         print(json.dumps({"output": str(output.resolve())}))
         return 0
@@ -539,6 +602,13 @@ def main(argv: list[str] | None = None) -> int:
         _require_versioned_rows(manifest_rows, "acquisition manifest")
         split_payload = json.loads(Path(args.splits).read_text(encoding="utf-8"))
         _require_versioned_splits(split_payload)
+        runtime_manifest_sha256 = sha256_file(args.manifest)
+        if split_payload.get("dataset1_manifest_sha256") != runtime_manifest_sha256:
+            raise SystemExit(
+                "locked splits are not bound to the supplied Dataset1 manifest: "
+                f"payload={split_payload.get('dataset1_manifest_sha256')!r} "
+                f"runtime={runtime_manifest_sha256!r}"
+            )
         stats, counts = compute_normalization_stats(
             args.root,
             args.manifest,
@@ -559,7 +629,7 @@ def main(argv: list[str] | None = None) -> int:
             "split": "pretrain",
             "stats": stats.to_dict(),
             "element_counts": counts,
-            "manifest_sha256": checksum(args.manifest),
+            "manifest_sha256": runtime_manifest_sha256,
             "splits_sha256": checksum(args.splits),
         }
         _write_or_print(payload, args.output)
@@ -586,15 +656,60 @@ def main(argv: list[str] | None = None) -> int:
         _require_versioned_rows(rows, "acquisition manifest")
         root = Path(args.root).resolve()
         output_dir = Path(args.output_dir).resolve()
+        manifest_sha256 = sha256_file(args.manifest)
+        cache_index: dict[str, Any] = {
+            "cache_schema_version": 3,
+            "scientific_semantics_version": 2,
+            "manifest_sha256": manifest_sha256,
+            "samples": {},
+        }
         written = 0
         skipped = 0
         for row in rows:
             if row.get("parse_status") != "parsed" or not row.get("training_eligible", False):
                 skipped += 1
                 continue
-            sample = read_nm_dicom(root / str(row["relative_path"]), config)
-            write_sample_cache(sample, output_dir)
+            source_path = root / str(row["relative_path"])
+            expected_source_sha256 = row.get("source_sha256")
+            if not expected_source_sha256:
+                raise SystemExit(
+                    f"manifest row {row.get('relative_path')} lacks source_sha256; "
+                    "regenerate the manifest before building a canonical cache"
+                )
+            actual_source_sha256 = sha256_file(source_path)
+            if actual_source_sha256 != expected_source_sha256:
+                raise SystemExit(
+                    f"source checksum mismatch for {source_path}: "
+                    f"manifest={expected_source_sha256} runtime={actual_source_sha256}"
+                )
+            sample = read_nm_dicom(source_path, config)
+            if str(sample.sample_id) != str(row.get("sample_id")):
+                raise SystemExit(f"manifest/sample identity mismatch for {source_path}")
+            if str(sample.geometry_hash) != str(row.get("geometry_hash")):
+                raise SystemExit(f"manifest/sample geometry mismatch for {source_path}")
+            row_bytes = json.dumps(row, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            row_sha256 = hashlib.sha256(row_bytes).hexdigest()
+            write_sample_cache(
+                sample,
+                output_dir,
+                source_relative_path=str(row["relative_path"]),
+                source_sha256=actual_source_sha256,
+                manifest_sha256=manifest_sha256,
+                manifest_row_sha256=row_sha256,
+            )
+            cache_index["samples"][str(sample.sample_id)] = {
+                "source_relative_path": str(row["relative_path"]),
+                "source_sha256": actual_source_sha256,
+                "manifest_row_sha256": row_sha256,
+                "checksums_sha256": sha256_file(
+                    output_dir / str(sample.sample_id) / "checksums.json"
+                ),
+            }
             written += 1
+        write_text_create_only(
+            output_dir / "cache_index.json",
+            json.dumps(cache_index, sort_keys=True, indent=2) + "\n",
+        )
         print(
             json.dumps(
                 {
@@ -681,15 +796,32 @@ def main(argv: list[str] | None = None) -> int:
         from .losses import EMATeacher, GlobalConsistencyHead
         from .training import (
             evaluate_epoch,
+            evaluate_scalar_rate_baseline,
             evaluate_two_view_epoch,
+            capture_rng_state,
+            load_checkpoint,
+            pretraining_checkpoint_is_eligible,
+            restore_rng_state,
             save_checkpoint,
             parameter_summary,
+            update_post_warmup_patience,
+            validate_resume_state,
             train_epoch,
             train_two_view_epoch,
         )
 
         if args.epochs < 1 or args.batch_size < 1 or args.accumulation_steps < 1:
             raise SystemExit("--epochs, --batch-size, and --accumulation-steps must be positive")
+        if args.warmup_epochs < 0 or args.warmup_epochs > args.epochs:
+            raise SystemExit("--warmup-epochs must lie between 0 and --epochs")
+        if args.early_stop_patience < 1:
+            raise SystemExit("--early-stop-patience must be positive")
+        if args.minimum_learning_rate <= 0 or args.minimum_learning_rate > args.learning_rate:
+            raise SystemExit(
+                "--minimum-learning-rate must be positive and no greater than --learning-rate"
+            )
+        if args.minimum_representation_std < 0:
+            raise SystemExit("--minimum-representation-std cannot be negative")
         if args.frame_chunk_size is not None and args.frame_chunk_size < 1:
             raise SystemExit("--frame-chunk-size must be positive when supplied")
         if args.num_workers < 0:
@@ -727,11 +859,27 @@ def main(argv: list[str] | None = None) -> int:
                 radius_mm=None,
             )
         )
+        artifact_binding = validate_normalization_binding(
+            args.normalization,
+            manifest_path=args.manifest,
+            splits_path=args.splits,
+        )
         normalization = NormalizationStats.from_json(args.normalization)
         split_payload = json.loads(Path(args.splits).read_text(encoding="utf-8"))
         _require_versioned_splits(split_payload)
         all_records = read_jsonl(args.manifest)
         _require_versioned_rows(all_records, "Dataset1 acquisition manifest")
+        try:
+            checked_sources = validate_manifest_source_bindings(args.root, all_records)
+        except Exception as exc:
+            raise SystemExit(str(exc)) from exc
+        expected_split_manifest = split_payload.get("dataset1_manifest_sha256")
+        runtime_manifest_sha256 = sha256_file(args.manifest)
+        if expected_split_manifest != runtime_manifest_sha256:
+            raise SystemExit(
+                "locked splits are not bound to the supplied Dataset1 manifest: "
+                f"payload={expected_split_manifest!r} runtime={runtime_manifest_sha256!r}"
+            )
         split_map = split_payload.get("dataset1", {})
         train_records = [
             row
@@ -766,10 +914,18 @@ def main(argv: list[str] | None = None) -> int:
         train_data = dataset_class(train_acquisitions, global_seed=args.seed)
         validation_data = dataset_class(validation_acquisitions, global_seed=args.seed)
         collate_function = collate_two_views if args.two_view else collate_acquisitions
+        # DataLoader iterator construction consumes a base seed even when
+        # validation shuffling is disabled.  Dedicated generators isolate
+        # those states from the model RNG and make them checkpoint-resumable.
+        train_loader_generator = torch.Generator(device="cpu")
+        train_loader_generator.manual_seed((int(args.seed) ^ 0x13579BDF) & 0xFFFFFFFF)
+        validation_loader_generator = torch.Generator(device="cpu")
+        validation_loader_generator.manual_seed((int(args.seed) ^ 0x2468ACE0) & 0xFFFFFFFF)
         train_loader = DataLoader(
             train_data,
             batch_size=args.batch_size,
             shuffle=True,
+            generator=train_loader_generator,
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
             # The dataset carries epoch-dependent augmentation state.  Worker
@@ -783,6 +939,7 @@ def main(argv: list[str] | None = None) -> int:
             validation_data,
             batch_size=args.batch_size,
             shuffle=False,
+            generator=validation_loader_generator,
             num_workers=args.num_workers,
             pin_memory=device.type == "cuda",
             persistent_workers=False,
@@ -816,11 +973,133 @@ def main(argv: list[str] | None = None) -> int:
         optimizer = torch.optim.AdamW(
             trainable_parameters, lr=args.learning_rate, weight_decay=args.weight_decay
         )
+        peak_learning_rate = float(args.learning_rate)
+        minimum_learning_rate_ratio = float(args.minimum_learning_rate / peak_learning_rate)
+
+        def learning_rate_multiplier(step: int) -> float:
+            if args.warmup_epochs > 0 and step < args.warmup_epochs:
+                return float(step + 1) / float(args.warmup_epochs)
+            decay_epochs = max(1, args.epochs - args.warmup_epochs)
+            progress = min(
+                1.0,
+                max(0.0, float(step - args.warmup_epochs + 1) / float(decay_epochs)),
+            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return minimum_learning_rate_ratio + (1.0 - minimum_learning_rate_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate_multiplier)
         scaler = torch.amp.GradScaler(
             "cuda",
             enabled=bool(args.amp and device.type == "cuda"),
             init_scale=args.amp_init_scale,
         )
+        training_contract = {
+            "seed": int(args.seed),
+            "epochs": int(args.epochs),
+            "device": str(device),
+            "amp": bool(args.amp and device.type == "cuda"),
+            "amp_init_scale": float(args.amp_init_scale),
+            "two_view": bool(args.two_view),
+            "batch_size": int(args.batch_size),
+            "accumulation_steps": int(args.accumulation_steps),
+            "learning_rate": float(args.learning_rate),
+            "weight_decay": float(args.weight_decay),
+            "warmup_epochs": int(args.warmup_epochs),
+            "early_stop_patience": int(args.early_stop_patience),
+            "minimum_learning_rate": float(args.minimum_learning_rate),
+            "minimum_representation_std": float(args.minimum_representation_std),
+            "representation_queue_capacity": int(args.representation_queue_capacity),
+            "covariance_loss_weight": float(args.covariance_loss_weight),
+            "covariance_min_samples": int(args.covariance_min_samples),
+            "frame_chunk_size": args.frame_chunk_size,
+            "num_workers": int(args.num_workers),
+            "max_batches": args.max_batches,
+            "loader_generator_contract": "dedicated_cpu_generators_v1",
+        }
+        latest_checkpoint_path = Path(
+            args.latest_checkpoint
+            if args.latest_checkpoint
+            else Path(args.checkpoint).with_name(
+                f"{Path(args.checkpoint).stem}_latest{Path(args.checkpoint).suffix}"
+            )
+        )
+        if latest_checkpoint_path.resolve() == Path(args.checkpoint).resolve():
+            raise SystemExit("--latest-checkpoint must differ from --checkpoint")
+        resume_info: dict[str, Any] | None = None
+        resume_start_epoch = 0
+        resumed_best_deviance = float("inf")
+        resumed_best_epoch: int | None = None
+        resumed_epochs_without_improvement = 0
+        if args.resume:
+            resume_modules: dict[str, torch.nn.Module] = {}
+            if args.two_view and ema_teacher is not None and consistency_head is not None:
+                resume_modules = {
+                    "ema_teacher": ema_teacher,
+                    "consistency_head": consistency_head,
+                }
+            if not latest_checkpoint_path.is_file():
+                raise SystemExit(
+                    "--resume requires the latest resumable checkpoint; "
+                    f"missing {latest_checkpoint_path}"
+                )
+            resume_info = load_checkpoint(
+                latest_checkpoint_path,
+                model,
+                optimizer,
+                extra_modules=resume_modules,
+                map_location=device,
+            )
+            resume_metadata = resume_info["metadata"]
+            if bool(resume_metadata.get("two_view", False)) != bool(args.two_view):
+                raise SystemExit("resume checkpoint two_view setting does not match the command")
+            if int(resume_metadata.get("resume_contract_version", 0)) != 1:
+                raise SystemExit(
+                    "resume checkpoint lacks the current reproducibility contract; start a fresh run"
+                )
+            stored_contract = resume_metadata.get("training_contract")
+            if not isinstance(stored_contract, Mapping):
+                raise SystemExit("resume checkpoint lacks the training contract; start a fresh run")
+            try:
+                validate_resume_contract(stored_contract, training_contract)
+            except Exception as exc:
+                raise SystemExit(str(exc)) from exc
+            validate_checkpoint_metadata(
+                resume_metadata,
+                normalization_sha256=sha256_file(args.normalization),
+                manifest_sha256=sha256_file(args.manifest),
+                splits_sha256=sha256_file(args.splits),
+            )
+            extra = resume_info.get("extra_state", {})
+            try:
+                validate_resume_state(extra, require_cuda=device.type == "cuda")
+            except Exception as exc:
+                raise SystemExit(str(exc) + "; start a fresh run") from exc
+            loader_states = extra["loader_generators"]
+            scheduler.load_state_dict(extra["scheduler"])
+            scaler.load_state_dict(extra["scaler"])
+            restore_rng_state(extra["rng_state"])
+            train_loader_generator.set_state(loader_states["train"].detach().cpu())
+            validation_loader_generator.set_state(loader_states["validation"].detach().cpu())
+            resume_start_epoch = int(resume_info["epoch"]) + 1
+            if resume_start_epoch >= args.epochs:
+                raise SystemExit(
+                    f"resume checkpoint epoch {resume_info['epoch']} already reaches --epochs={args.epochs}"
+                )
+            training_state = extra["training_state"]
+            resumed_best_deviance = float(training_state["best_deviance"])
+            if not math.isfinite(resumed_best_deviance) and not math.isinf(resumed_best_deviance):
+                raise SystemExit(
+                    "resume checkpoint has a non-finite best deviance; start a fresh run"
+                )
+            raw_best_epoch = training_state["best_epoch"]
+            resumed_best_epoch = int(raw_best_epoch) if raw_best_epoch is not None else None
+            resumed_epochs_without_improvement = int(
+                training_state["epochs_without_improvement"]
+            )
+            if resumed_epochs_without_improvement < 0:
+                raise SystemExit(
+                    "resume checkpoint has an invalid patience counter; start a fresh run"
+                )
         metrics_path = Path(args.metrics_output) if args.metrics_output else Path(args.checkpoint).with_name("metrics.jsonl")
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
         log_path = (
@@ -831,7 +1110,41 @@ def main(argv: list[str] | None = None) -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         if log_path.resolve() == metrics_path.resolve():
             raise SystemExit("--log-output and --metrics-output must be different files")
+        existing_outputs = [Path(args.checkpoint), latest_checkpoint_path, metrics_path, log_path]
+        if args.resume:
+            if not latest_checkpoint_path.is_file():
+                raise SystemExit(
+                    "--resume requires an existing --latest-checkpoint: "
+                    f"{latest_checkpoint_path}"
+                )
+        elif not args.overwrite:
+            existing = [str(path.resolve()) for path in existing_outputs if path.exists()]
+            if existing:
+                raise SystemExit(
+                    "refusing to append or overwrite existing run outputs; choose a fresh "
+                    "run directory or pass --overwrite explicitly: " + ", ".join(existing)
+                )
+        elif args.overwrite:
+            for path in (metrics_path, log_path):
+                if path.exists():
+                    path.write_text("", encoding="utf-8")
         run_started = time.perf_counter()
+        if args.resume:
+            stored_baseline = resume_info["metadata"].get(
+                "scalar_rate_baseline_validation_deviance"
+            ) if resume_info is not None else None
+            if not isinstance(stored_baseline, (int, float)) or not math.isfinite(float(stored_baseline)):
+                raise SystemExit(
+                    "resume checkpoint lacks a finite scalar-rate baseline; start a fresh run"
+                )
+            # The latest checkpoint already contains the immutable baseline.
+            # Re-evaluating it here would consume a validation DataLoader RNG
+            # state and change the next training stream after resume.
+            scalar_baseline_deviance = float(stored_baseline)
+        else:
+            scalar_baseline_deviance = evaluate_scalar_rate_baseline(
+                validation_loader, device=device, max_batches=args.max_batches
+            )
 
         def terminal_event_text(payload: Mapping[str, Any]) -> str:
             event = str(payload.get("event", "event"))
@@ -931,12 +1244,14 @@ def main(argv: list[str] | None = None) -> int:
                     f"train_loss={float(payload['train_loss']):.6f} "
                     f"validation_loss={float(payload['validation_loss']):.6f} "
                     f"validation_deviance={float(payload['validation_deviance']):.6f} "
+                    f"validation_masked_deviance={float(payload['validation_masked_deviance']):.6f} "
                     f"time={float(payload['epoch_seconds']):.1f}s"
                 )
             if event == "run_end":
+                best = payload.get("best_validation_deviance")
                 return (
                     f"[run] complete best_validation_deviance="
-                    f"{float(payload['best_validation_deviance']):.6f}"
+                    f"{('none' if best is None else f'{float(best):.6f}')}"
                 )
             return f"[{event}]"
 
@@ -973,12 +1288,27 @@ def main(argv: list[str] | None = None) -> int:
                 "batch_size": args.batch_size,
                 "accumulation_steps": args.accumulation_steps,
                 "effective_batch_size": args.batch_size * args.accumulation_steps,
+                "warmup_epochs": args.warmup_epochs,
+                "early_stop_patience": args.early_stop_patience,
+                "minimum_learning_rate": args.minimum_learning_rate,
+                "minimum_representation_std": args.minimum_representation_std,
+                "scalar_rate_baseline_validation_deviance": scalar_baseline_deviance,
+                "learning_rate_schedule": "linear_warmup_then_cosine",
                 "frame_chunk_size": args.frame_chunk_size,
                 "max_batches": args.max_batches,
                 "num_workers": args.num_workers,
                 "persistent_workers": False,
                 "augmentation_seed_contract": "v2_worker_independent",
                 "validation_augmentation_seed": 0,
+                "source_bindings_checked": checked_sources,
+                "resume": bool(args.resume),
+                "resume_checkpoint_epoch": (
+                    int(resume_info["epoch"]) if resume_info is not None else None
+                ),
+                "latest_checkpoint": str(latest_checkpoint_path.resolve()),
+                "training_contract": training_contract,
+                "code_revision": code_revision_report(),
+                "environment": environment_report(),
                 "log_interval": args.log_interval,
                 "amp": bool(args.amp and device.type == "cuda"),
                 "amp_init_scale": args.amp_init_scale,
@@ -997,8 +1327,10 @@ def main(argv: list[str] | None = None) -> int:
                 "log_output": str(log_path.resolve()),
             }
         )
-        best_deviance = float("inf")
-        for epoch in range(args.epochs):
+        best_deviance = resumed_best_deviance
+        best_epoch: int | None = resumed_best_epoch
+        epochs_without_improvement = resumed_epochs_without_improvement
+        for epoch in range(resume_start_epoch, args.epochs):
             epoch_started = time.perf_counter()
             train_data.set_epoch(epoch)
             validation_data.set_epoch(0)
@@ -1063,6 +1395,8 @@ def main(argv: list[str] | None = None) -> int:
                 "train_deviance": train_metrics.deviance,
                 "validation_loss": validation_metrics.loss,
                 "validation_deviance": validation_metrics.deviance,
+                "train_masked_deviance": train_metrics.masked_deviance,
+                "validation_masked_deviance": validation_metrics.masked_deviance,
                 "train_masked": train_metrics.masked,
                 "train_visible": train_metrics.visible,
                 "validation_masked": validation_metrics.masked,
@@ -1079,11 +1413,38 @@ def main(argv: list[str] | None = None) -> int:
             row.update(
                 {f"validation_health_{key}": value for key, value in validation_metrics.health.items()}
             )
+            checkpoint_eligible = pretraining_checkpoint_is_eligible(
+                validation_metrics,
+                scalar_baseline_deviance=scalar_baseline_deviance,
+                minimum_representation_std=args.minimum_representation_std,
+            )
+            row.update(
+                {
+                    "scalar_rate_baseline_validation_deviance": scalar_baseline_deviance,
+                    "scalar_rate_baseline_validation_masked_deviance": scalar_baseline_deviance,
+                    "checkpoint_representation_std": validation_metrics.health.get(
+                        "representation_std"
+                    ),
+                    "checkpoint_eligible": checkpoint_eligible,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                }
+            )
             with metrics_path.open("a", encoding="utf-8", newline="\n") as handle:
                 handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
             emit_event({"event": "epoch_end", **row})
-            if validation_metrics.deviance < best_deviance:
-                best_deviance = validation_metrics.deviance
+            # Advance the schedule before serializing a resumable checkpoint so
+            # the next epoch starts with exactly the same optimizer state.
+            scheduler.step()
+            post_warmup = epoch + 1 > args.warmup_epochs
+            selection_deviance = (
+                validation_metrics.masked_deviance
+                if validation_metrics.masked_deviance is not None
+                else validation_metrics.deviance
+            )
+            if checkpoint_eligible and selection_deviance < best_deviance:
+                best_deviance = selection_deviance
+                best_epoch = epoch
+                epochs_without_improvement = 0
                 save_checkpoint(
                     args.checkpoint,
                     model,
@@ -1115,23 +1476,137 @@ def main(argv: list[str] | None = None) -> int:
                         "splits": str(Path(args.splits).resolve()),
                         "manifest_sha256": sha256_file(args.manifest),
                         "splits_sha256": sha256_file(args.splits),
+                        "artifact_binding": artifact_binding,
+                        "overwrite_explicit": bool(args.overwrite),
+                        "scalar_rate_baseline_validation_deviance": scalar_baseline_deviance,
+                        "minimum_representation_std": args.minimum_representation_std,
+                        "learning_rate_schedule": "linear_warmup_then_cosine",
+                        "warmup_epochs": args.warmup_epochs,
+                        "early_stop_patience": args.early_stop_patience,
+                        "minimum_learning_rate": args.minimum_learning_rate,
+                        "source_bindings_checked": checked_sources,
+                        "code_revision": code_revision_report(),
+                        "environment": environment_report(),
+                        "command_line": list(sys.argv),
+                        "resume_contract_version": 1,
+                        "training_contract": training_contract,
                     },
-                    extra_state=(
-                        {
-                            "ema_teacher": ema_teacher.state_dict(),
-                            "consistency_head": consistency_head.state_dict(),
-                        }
-                        if args.two_view and ema_teacher is not None and consistency_head is not None
-                        else None
-                    ),
+                    extra_state={
+                        "ema_teacher": (
+                            ema_teacher.state_dict()
+                            if args.two_view and ema_teacher is not None
+                            else None
+                        ),
+                        "consistency_head": (
+                            consistency_head.state_dict()
+                            if args.two_view and consistency_head is not None
+                            else None
+                        ),
+                        "scheduler": scheduler.state_dict(),
+                        "scaler": scaler.state_dict(),
+                        "rng_state": capture_rng_state(),
+                        "loader_generators": {
+                            "train": train_loader_generator.get_state(),
+                            "validation": validation_loader_generator.get_state(),
+                        },
+                        "training_state": {
+                            "best_deviance": best_deviance,
+                            "best_epoch": best_epoch,
+                            "epochs_without_improvement": epochs_without_improvement,
+                        },
+                    },
+                    overwrite=True,
                 )
+            else:
+                epochs_without_improvement = update_post_warmup_patience(
+                    epochs_without_improvement,
+                    epoch_number=epoch + 1,
+                    warmup_epochs=args.warmup_epochs,
+                    improved=False,
+                )
+            # Persist the latest state independently of best-checkpoint
+            # selection so an interruption after a non-improving epoch is
+            # resumable without losing the patience counter or RNG stream.
+            latest_metadata = {
+                "task": "pretraining",
+                "seed": args.seed,
+                "device": str(device),
+                "amp": bool(args.amp and device.type == "cuda"),
+                "two_view": bool(args.two_view),
+                "normalization_sha256": sha256_file(args.normalization),
+                "manifest_sha256": sha256_file(args.manifest),
+                "splits_sha256": sha256_file(args.splits),
+                "training_contract": training_contract,
+                "resume_contract_version": 1,
+                "latest_checkpoint": str(latest_checkpoint_path.resolve()),
+                "scalar_rate_baseline_validation_deviance": scalar_baseline_deviance,
+            }
+            latest_extra_state = {
+                "ema_teacher": (
+                    ema_teacher.state_dict()
+                    if args.two_view and ema_teacher is not None
+                    else None
+                ),
+                "consistency_head": (
+                    consistency_head.state_dict()
+                    if args.two_view and consistency_head is not None
+                    else None
+                ),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "rng_state": capture_rng_state(),
+                "loader_generators": {
+                    "train": train_loader_generator.get_state(),
+                    "validation": validation_loader_generator.get_state(),
+                },
+                "training_state": {
+                    "best_deviance": best_deviance,
+                    "best_epoch": best_epoch,
+                    "epochs_without_improvement": epochs_without_improvement,
+                },
+            }
+            save_checkpoint(
+                latest_checkpoint_path,
+                model,
+                optimizer,
+                epoch=epoch,
+                metrics=row,
+                metadata=latest_metadata,
+                extra_state=latest_extra_state,
+                overwrite=True,
+            )
+            if (
+                post_warmup
+                and epochs_without_improvement >= args.early_stop_patience
+            ):
+                emit_event(
+                    {
+                        "event": "early_stop",
+                        "epoch": epoch,
+                        "patience": args.early_stop_patience,
+                        "best_epoch": best_epoch,
+                        "best_validation_deviance": (
+                            best_deviance if math.isfinite(best_deviance) else None
+                        ),
+                        "reason": "no eligible checkpoint improvement",
+                    }
+                )
+                break
         emit_event(
             {
                 "event": "run_end",
                 "checkpoint": str(Path(args.checkpoint).resolve()),
                 "metrics": str(metrics_path.resolve()),
                 "log": str(log_path.resolve()),
-                "best_validation_deviance": best_deviance,
+                "best_validation_deviance": (
+                    best_deviance if math.isfinite(best_deviance) else None
+                ),
+                "best_validation_masked_deviance": (
+                    best_deviance if math.isfinite(best_deviance) else None
+                ),
+                "best_epoch": best_epoch,
+                "checkpoint_saved": best_epoch is not None,
+                "scalar_rate_baseline_validation_deviance": scalar_baseline_deviance,
             }
         )
         return 0
@@ -1197,6 +1672,40 @@ def main(argv: list[str] | None = None) -> int:
         split_map = split_payload.get("dataset2", {})
         pair_records = read_jsonl(args.pairs)
         _require_versioned_rows(pair_records, "Dataset2 pair manifest")
+        dataset2_rows = read_jsonl(args.dataset2_manifest)
+        _require_versioned_rows(dataset2_rows, "Dataset2 acquisition manifest")
+        try:
+            validate_normalization_binding(
+                args.normalization,
+                manifest_path=args.dataset1_manifest,
+                splits_path=args.splits,
+            )
+            expected_dataset1_manifest = split_payload.get("dataset1_manifest_sha256")
+            runtime_dataset1_manifest = sha256_file(args.dataset1_manifest)
+            if expected_dataset1_manifest != runtime_dataset1_manifest:
+                raise SystemExit(
+                    "locked splits are not bound to the supplied Dataset1 manifest: "
+                    f"payload={expected_dataset1_manifest!r} runtime={runtime_dataset1_manifest!r}"
+                )
+            expected_pair_manifest = split_payload.get("pair_manifest_sha256")
+            runtime_pair_manifest = sha256_file(args.pairs)
+            if expected_pair_manifest != runtime_pair_manifest:
+                raise SystemExit(
+                    "locked splits are not bound to the supplied Dataset2 pair manifest: "
+                    f"payload={expected_pair_manifest!r} runtime={runtime_pair_manifest!r}"
+                )
+            expected_dataset2_manifest = split_payload.get("dataset2_manifest_sha256")
+            runtime_dataset2_manifest = sha256_file(args.dataset2_manifest)
+            if expected_dataset2_manifest != runtime_dataset2_manifest:
+                raise SystemExit(
+                    "locked splits are not bound to the supplied Dataset2 manifest: "
+                    f"payload={expected_dataset2_manifest!r} runtime={runtime_dataset2_manifest!r}"
+                )
+            validate_pair_source_bindings(args.root, pair_records)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            raise SystemExit(str(exc)) from exc
         accepted = [row for row in pair_records if bool(row.get("accepted"))]
         train_records = [
             row for row in accepted if split_map.get(str(row.get("patient_key"))) == "train"
@@ -1703,6 +2212,7 @@ def main(argv: list[str] | None = None) -> int:
                         "pairs_sha256": pairs_sha256,
                         "splits_sha256": splits_sha256,
                     },
+                    overwrite=True,
                 )
             else:
                 epochs_without_improvement += 1

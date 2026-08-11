@@ -88,6 +88,18 @@ def build_matched_command(
         str(seed),
         "--legacy-backbone-transfer",
     ]
+    dataset1_manifest = getattr(args, "dataset1_manifest", None)
+    if dataset1_manifest:
+        command[command.index("--normalization") + 2:command.index("--pretrained-checkpoint")] = [
+            "--dataset1-manifest",
+            dataset1_manifest,
+        ] + command[command.index("--normalization") + 2:command.index("--pretrained-checkpoint")]
+    dataset2_manifest = getattr(args, "dataset2_manifest", None)
+    if dataset2_manifest:
+        command[command.index("--pairs") + 2:command.index("--splits")] = [
+            "--dataset2-manifest",
+            dataset2_manifest,
+        ] + command[command.index("--pairs") + 2:command.index("--splits")]
     if initialization == "scratch":
         command.append("--scratch")
     metadata = {
@@ -110,8 +122,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--pairs", required=True)
+    parser.add_argument("--dataset2-manifest", required=True)
     parser.add_argument("--splits", required=True)
     parser.add_argument("--normalization", required=True)
+    parser.add_argument("--dataset1-manifest", required=True)
     parser.add_argument("--pretrained-checkpoint", required=True)
     parser.add_argument("--migration-report", required=True)
     parser.add_argument("--output-root", required=True)

@@ -19,6 +19,8 @@ def main() -> int:
     parser.add_argument("--pairs", required=True)
     parser.add_argument("--splits", required=True)
     parser.add_argument("--normalization", required=True)
+    parser.add_argument("--dataset1-manifest", required=True)
+    parser.add_argument("--dataset2-manifest", required=True)
     parser.add_argument("--pretrained-checkpoint", required=True)
     parser.add_argument("--migration-report")
     parser.add_argument("--output-root", required=True)
@@ -58,6 +60,10 @@ def main() -> int:
                 args.splits,
                 "--normalization",
                 args.normalization,
+                "--dataset1-manifest",
+                args.dataset1_manifest,
+                "--dataset2-manifest",
+                args.dataset2_manifest,
                 "--pretrained-checkpoint",
                 args.pretrained_checkpoint,
                 "--checkpoint",

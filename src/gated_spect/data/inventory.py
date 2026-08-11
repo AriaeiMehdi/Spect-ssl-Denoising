@@ -12,7 +12,7 @@ from pydicom.dataset import Dataset
 
 from ..types import ReaderConfig
 from .dicom_reader import stable_identity_key
-from ..versioning import artifact_version_metadata
+from ..versioning import artifact_version_metadata, write_text_create_only
 
 
 def _file_sha256(path: Path) -> str:
@@ -121,9 +121,6 @@ def write_jsonl(rows: Iterable[dict[str, Any]], output: str | Path) -> Path:
     """Write a deterministic JSONL manifest without absolute patient paths."""
 
     destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(rows, key=lambda row: (str(row.get("dataset_id")), str(row.get("relative_path"))))
-    with destination.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in ordered:
-            handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
-    return destination
+    text = "".join(json.dumps(row, sort_keys=True, allow_nan=False) + "\n" for row in ordered)
+    return write_text_create_only(destination, text)

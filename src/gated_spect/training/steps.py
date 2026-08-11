@@ -18,6 +18,7 @@ class PretrainingLoss:
     masked: Tensor
     visible: Tensor
     deviance: Tensor
+    masked_deviance: Tensor
     health: dict[str, Tensor] = field(default_factory=dict)
 
 
@@ -107,6 +108,14 @@ def pretraining_objective(
         bin_weight=visible_target,
     )
     selected = (masked_target.to(dtype=rate.dtype) + visible_target.to(dtype=rate.dtype)).clamp_max(1.0)
+    masked_deviance = weighted_poisson_nll(
+        poisson_deviance(mean, target_counts.to(dtype=rate.dtype), reduction="none"),
+        torch.zeros_like(mean),
+        target_weight,
+        bin_weight=masked_target,
+    )
+    # Keep the union metric for diagnostics, while checkpoint selection uses
+    # the literal masked-target metric required by the training plan.
     deviance = weighted_poisson_nll(
         poisson_deviance(mean, target_counts.to(dtype=rate.dtype), reduction="none"),
         torch.zeros_like(mean),
@@ -118,6 +127,7 @@ def pretraining_objective(
         masked=masked,
         visible=visible,
         deviance=deviance,
+        masked_deviance=masked_deviance,
         health=_rate_health(
             rate,
             target_weight,

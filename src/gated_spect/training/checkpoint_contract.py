@@ -57,6 +57,17 @@ _MIGRATION_HASH_FIELDS = (
     "new_normalization_sha256",
 )
 
+_MIGRATION_GATE_FIELDS = (
+    "count_normalization_unchanged",
+    "radius_normalization_unchanged",
+    "element_counts_unchanged",
+    "geometry_inputs_unchanged",
+    "exact_sample_coverage",
+    "finite_exposure_deltas",
+)
+_MIGRATION_MAX_MEAN_ABS_DELTA_Z = 1.0e-3
+_MIGRATION_MAX_P99_ABS_DELTA_Z = 1.0e-2
+
 
 def validate_checkpoint_metadata(
     metadata: Mapping[str, Any],
@@ -103,6 +114,48 @@ def validate_checkpoint_metadata(
             raise IncompatibleArtifactError(
                 "legacy migration report lacks complete exact-artifact hashes: "
                 + ", ".join(missing or ["artifact_hashes_complete"])
+            )
+        missing_gates = [
+            field for field in _MIGRATION_GATE_FIELDS if report.get(field) is not True
+        ]
+        if report.get("migration_error_count") != 0:
+            missing_gates.append("migration_error_count=0")
+        split_summary = report.get("patient_split_migration", {})
+        if not isinstance(split_summary, Mapping) or split_summary.get("unchanged") is not True:
+            missing_gates.append("patient_split_migration.unchanged")
+        if missing_gates:
+            raise IncompatibleArtifactError(
+                "legacy migration report lacks strict error-free compatibility gates: "
+                + ", ".join(missing_gates)
+            )
+        mean_delta = report.get("mean_abs_delta_z")
+        p99_delta = report.get("p99_abs_delta_z")
+        if (
+            not isinstance(mean_delta, (int, float))
+            or not isinstance(p99_delta, (int, float))
+            or not torch.isfinite(torch.tensor(float(mean_delta)))
+            or not torch.isfinite(torch.tensor(float(p99_delta)))
+            or float(mean_delta) >= _MIGRATION_MAX_MEAN_ABS_DELTA_Z
+            or float(p99_delta) >= _MIGRATION_MAX_P99_ABS_DELTA_Z
+        ):
+            raise IncompatibleArtifactError(
+                "legacy migration report fails standardized-exposure delta thresholds"
+            )
+        thresholds = report.get("compatibility_thresholds")
+        threshold_values = (
+            thresholds.get("mean_abs_delta_z_max_exclusive")
+            if isinstance(thresholds, Mapping)
+            else None,
+            thresholds.get("p99_abs_delta_z_max_exclusive")
+            if isinstance(thresholds, Mapping)
+            else None,
+        )
+        if threshold_values != (
+            _MIGRATION_MAX_MEAN_ABS_DELTA_Z,
+            _MIGRATION_MAX_P99_ABS_DELTA_Z,
+        ):
+            raise IncompatibleArtifactError(
+                "legacy migration report does not record the approved delta thresholds"
             )
         if legacy_checkpoint_sha256 is None:
             raise IncompatibleArtifactError(

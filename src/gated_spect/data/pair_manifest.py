@@ -11,7 +11,7 @@ from typing import Any, Iterable
 from ..types import PairProvenance, ReaderConfig
 from .dicom_reader import read_nm_dicom, stable_identity_key
 from .pairing import verify_pair
-from ..versioning import artifact_version_metadata
+from ..versioning import artifact_version_metadata, write_text_create_only
 
 
 @dataclass(frozen=True)
@@ -86,6 +86,8 @@ def audit_duration_pairs(
                     "high_sample_key": stable_identity_key(high.sample_id, label="sample", config=config),
                     "low_relative_path": str(pair.low_path.relative_to(root_path)),
                     "high_relative_path": str(pair.high_path.relative_to(root_path)),
+                    "low_source_sha256": hashlib.sha256(pair.low_path.read_bytes()).hexdigest(),
+                    "high_source_sha256": hashlib.sha256(pair.high_path.read_bytes()).hexdigest(),
                     "accepted": result.accepted,
                     "provenance": result.provenance.value,
                     "reason": result.reason,
@@ -108,8 +110,5 @@ def audit_duration_pairs(
 
 def write_pair_manifest(rows: Iterable[dict[str, Any]], output: str | Path) -> Path:
     destination = Path(output)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", encoding="utf-8", newline="\n") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, sort_keys=True, allow_nan=False) + "\n")
-    return destination
+    text = "".join(json.dumps(row, sort_keys=True, allow_nan=False) + "\n" for row in rows)
+    return write_text_create_only(destination, text)
